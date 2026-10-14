@@ -291,7 +291,12 @@ def join_wiki_partition(
             for key, document in documents_by_key.items()
             if key in referenced_documents
         ],
-        [dict(link) for link in source_links],
+        [
+            dict(link)
+            for link in source_links
+            if wiki_document_project_key(link["document_id"], link["project"])
+            in referenced_documents
+        ],
     )
 
 

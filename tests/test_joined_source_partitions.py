@@ -440,6 +440,38 @@ def test_wiki_keeps_referenced_documents_with_native_typed_fields() -> None:
     assert isinstance(partition.documents[0]["updated_at"], datetime)
 
 
+def test_wiki_persists_only_referenced_document_links_in_source_order() -> None:
+    linked_at = datetime(2026, 4, 5, 6, 7, 8)
+    first = {
+        "document_id": "document-1",
+        "project": "project-a",
+        "polygon_id": "polygon-1",
+        "revision_id": 123,
+        "linked_at": linked_at,
+    }
+    unreferenced = {
+        "document_id": "document-1",
+        "project": "project-b",
+        "polygon_id": "polygon-3",
+        "revision_id": None,
+        "linked_at": None,
+    }
+    second = {
+        "document_id": "document-2",
+        "project": "project-b",
+        "polygon_id": "polygon-3",
+        "input_revision": "snapshot-7",
+    }
+    links = [first, unreferenced, second, dict(first)]
+
+    partition = _join_wiki(links=links)
+
+    assert list(partition.polygon_document_links) == [first, second, first]
+    assert type(partition.polygon_document_links[0]["revision_id"]) is int
+    assert partition.polygon_document_links[0]["linked_at"] == linked_at
+    assert "revision_id" not in partition.polygon_document_links[1]
+
+
 def test_wiki_keeps_raw_language_code_and_source_url_per_text_unit() -> None:
     units = _units_by_key(_join_wiki())
 
