@@ -22,6 +22,7 @@ BAZAAR_GEOJSON = '{"type":"Point","coordinates":[69.1723,34.5282]}'
 WIKI_GEOJSON_1 = '{"type":"Point","coordinates":[69.2,34.5]}'
 WIKI_GEOJSON_2 = '{"type":"Point","coordinates":[69.1,34.4]}'
 LINK_FIELDS = ("document_id", "project", "polygon_id", "input_revision")
+NativeSourceRows = dict[str, dict[str, list[dict[str, Any]]]]
 
 DESCRIPTION_NATIVE_TEXTS: list[dict[str, Any]] = [
     {
@@ -103,8 +104,7 @@ DESCRIPTION_NATIVE_LABELS: list[dict[str, Any]] = [
     },
 ]
 
-# Same OSM text on two '|' or ':' joins: naive string keys would collide.
-SEPARATOR_TEXTS: list[dict[str, Any]] = [
+OSM_KEY_DELIMITER_COLLISION_TEXTS: list[dict[str, Any]] = [
     {
         "description_identity": "description-a",
         "source_pbf": "north|south",
@@ -128,7 +128,7 @@ SEPARATOR_TEXTS: list[dict[str, Any]] = [
         "sentences": None,
     },
 ]
-SEPARATOR_POLYGONS: list[dict[str, Any]] = [
+OSM_KEY_DELIMITER_COLLISION_POLYGONS: list[dict[str, Any]] = [
     {
         "source_pbf": "north|south",
         "osm_type": "way",
@@ -142,7 +142,7 @@ SEPARATOR_POLYGONS: list[dict[str, Any]] = [
         "geometry": b"geometry-b",
     },
 ]
-SEPARATOR_LABELS: list[dict[str, Any]] = [
+OSM_KEY_DELIMITER_COLLISION_LABELS: list[dict[str, Any]] = [
     {
         "description_identity": "description-a",
         "tag_key": "name",
@@ -157,8 +157,7 @@ SEPARATOR_LABELS: list[dict[str, Any]] = [
     },
 ]
 
-# The same OSM entity appears in two PBF snapshots with distinct identities.
-SNAPSHOT_TEXTS: list[dict[str, Any]] = [
+TEXTS_FROM_SEPARATE_PBF_SNAPSHOTS: list[dict[str, Any]] = [
     {
         "description_identity": "description-2025",
         "source_pbf": OTHER_PBF,
@@ -182,7 +181,7 @@ SNAPSHOT_TEXTS: list[dict[str, Any]] = [
         "sentences": None,
     },
 ]
-SNAPSHOT_POLYGONS: list[dict[str, Any]] = [
+POLYGONS_FROM_SEPARATE_PBF_SNAPSHOTS: list[dict[str, Any]] = [
     {
         "source_pbf": OTHER_PBF,
         "osm_type": "way",
@@ -196,7 +195,7 @@ SNAPSHOT_POLYGONS: list[dict[str, Any]] = [
         "geometry": b"geometry-2026",
     },
 ]
-SNAPSHOT_LABELS: list[dict[str, Any]] = [
+LABELS_FROM_SEPARATE_PBF_SNAPSHOTS: list[dict[str, Any]] = [
     {
         "description_identity": "description-2025",
         "tag_key": "name",
@@ -337,8 +336,7 @@ WIKI_NATIVE_POLYGONS: list[dict[str, Any]] = [
     {"polygon_id": "polygon-kabul-1", "geometry": WIKI_GEOJSON_1},
     {"polygon_id": "polygon-kabul-2", "geometry": WIKI_GEOJSON_2},
 ]
-# The third row repeats the first link; the last links one polygon to two documents.
-WIKI_NATIVE_LINKS: list[dict[str, Any]] = [
+WIKI_NATIVE_LINK_OCCURRENCES: list[dict[str, Any]] = [
     {
         "document_id": "document-kabul",
         "project": "wikipedia",
@@ -414,7 +412,7 @@ def _join_native_wiki() -> JoinedPartition:
         label_rows=WIKI_NATIVE_LABELS,
         sentence_rows=WIKI_NATIVE_SENTENCES,
         document_rows=WIKI_NATIVE_DOCUMENTS,
-        link_rows=WIKI_NATIVE_LINKS,
+        link_rows=WIKI_NATIVE_LINK_OCCURRENCES,
         polygon_rows=WIKI_NATIVE_POLYGONS,
     )
 
@@ -516,9 +514,9 @@ def test_native_description_polygon_ids_are_deterministic() -> None:
 
 def test_native_description_polygon_ids_do_not_collide_on_separators() -> None:
     partition = _join_native_description(
-        labels=SEPARATOR_LABELS,
-        texts=SEPARATOR_TEXTS,
-        polygons=SEPARATOR_POLYGONS,
+        labels=OSM_KEY_DELIMITER_COLLISION_LABELS,
+        texts=OSM_KEY_DELIMITER_COLLISION_TEXTS,
+        polygons=OSM_KEY_DELIMITER_COLLISION_POLYGONS,
     )
     expected = {
         ("description-a", "name", 0): [b"geometry-a"],
@@ -531,9 +529,9 @@ def test_native_description_polygon_ids_do_not_collide_on_separators() -> None:
 
 def test_native_description_same_osm_entity_stays_separate_per_snapshot() -> None:
     partition = _join_native_description(
-        labels=SNAPSHOT_LABELS,
-        texts=SNAPSHOT_TEXTS,
-        polygons=SNAPSHOT_POLYGONS,
+        labels=LABELS_FROM_SEPARATE_PBF_SNAPSHOTS,
+        texts=TEXTS_FROM_SEPARATE_PBF_SNAPSHOTS,
+        polygons=POLYGONS_FROM_SEPARATE_PBF_SNAPSHOTS,
     )
     expected = {
         ("description-2025", "name", 0): [b"geometry-2025"],
@@ -636,7 +634,7 @@ def test_native_wiki_polygon_document_links_keep_every_source_occurrence() -> No
 
     kept = sorted(tuple(row[name] for name in LINK_FIELDS) for row in links)
     sourced = sorted(
-        tuple(row[name] for name in LINK_FIELDS) for row in WIKI_NATIVE_LINKS
+        tuple(row[name] for name in LINK_FIELDS) for row in WIKI_NATIVE_LINK_OCCURRENCES
     )
     assert kept == sourced
     pairs = [(row["document_id"], row["polygon_id"]) for row in links]
@@ -655,18 +653,55 @@ def test_native_wiki_text_units_expose_polygon_ids_from_every_link() -> None:
     assert units["sentence-gamma-1"]["polygon_ids"] == ["polygon-kabul-1"]
 
 
-@given("native description, website, and wiki rows with their pinned column names")
-def pinned_native_rows() -> None:
-    # The pinned column names are carried by the module fixtures above.
-    return None
+@given(
+    "native rows declared with the frozen source column names",
+    target_fixture="native_source_rows",
+)
+def native_source_rows() -> NativeSourceRows:
+    return {
+        "description": {
+            "labels": DESCRIPTION_NATIVE_LABELS,
+            "text_units": DESCRIPTION_NATIVE_TEXTS,
+            "polygons": DESCRIPTION_NATIVE_POLYGONS,
+        },
+        "website": {
+            "labels": WEBSITE_NATIVE_LABELS,
+            "polygons_and_text": WEBSITE_NATIVE_POLYGONS,
+        },
+        "wiki": {
+            "labels": WIKI_NATIVE_LABELS,
+            "text_units": WIKI_NATIVE_SENTENCES,
+            "documents": WIKI_NATIVE_DOCUMENTS,
+            "links": WIKI_NATIVE_LINK_OCCURRENCES,
+            "polygons": WIKI_NATIVE_POLYGONS,
+        },
+    }
 
 
 @when("each native source is joined to its labels", target_fixture="native_partitions")
-def join_native_sources() -> dict[str, JoinedPartition]:
+def join_native_sources(
+    native_source_rows: NativeSourceRows,
+) -> dict[str, JoinedPartition]:
+    description_rows = native_source_rows["description"]
+    website_rows = native_source_rows["website"]
+    wiki_rows = native_source_rows["wiki"]
     return {
-        "description": _join_native_description(),
-        "website": _join_native_website(),
-        "wiki": _join_native_wiki(),
+        "description": join_description_partition(
+            label_rows=description_rows["labels"],
+            text_unit_rows=description_rows["text_units"],
+            polygon_rows=description_rows["polygons"],
+        ),
+        "website": join_website_partition(
+            label_rows=website_rows["labels"],
+            polygon_text_rows=website_rows["polygons_and_text"],
+        ),
+        "wiki": join_wiki_partition(
+            label_rows=wiki_rows["labels"],
+            sentence_rows=wiki_rows["text_units"],
+            document_rows=wiki_rows["documents"],
+            link_rows=wiki_rows["links"],
+            polygon_rows=wiki_rows["polygons"],
+        ),
     }
 
 
@@ -694,4 +729,4 @@ def wiki_links_kept_per_occurrence(
     native_partitions: dict[str, JoinedPartition],
 ) -> None:
     links = native_partitions["wiki"].polygon_document_links
-    assert len(links) == len(WIKI_NATIVE_LINKS)
+    assert len(links) == len(WIKI_NATIVE_LINK_OCCURRENCES)
