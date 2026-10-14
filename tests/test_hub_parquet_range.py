@@ -130,6 +130,8 @@ def test_reader_rejects_a_non_partial_response() -> None:
         ({"Content-Range": "bytes 0-3/9"}, 0),
         ({"Content-Range": ""}, 0),
         ({"Content-Length": "3"}, 0),
+        ({"Content-Length": ""}, 0),
+        ({"Content-Encoding": "gzip"}, 0),
         ({"Content-Length": "5"}, 1),
         ({}, -1),
     ],
@@ -166,6 +168,20 @@ def test_reader_enforces_a_cumulative_per_source_byte_budget() -> None:
 
         assert reader.bytes_read == 3
         assert len(server.requests) == 1
+
+
+def test_reader_allows_exact_budget_use_and_blocks_the_next_byte() -> None:
+    payload = b"abcd"
+    source = _source(payload)
+    server = FakeRangeServer(payload)
+
+    with HubParquetRangeReader(source, max_bytes=3, opener=server) as reader:
+        assert reader.read(3) == payload[:3]
+        with pytest.raises(ByteBudgetExceeded):
+            reader.read(1)
+        assert reader.bytes_read == 3
+
+    assert len(server.requests) == 1
 
 
 def test_reader_seek_and_read_stay_within_the_pinned_file_size() -> None:
@@ -229,21 +245,59 @@ def test_pinned_source_rejects_mutation_and_mutable_revisions() -> None:
             size_bytes=7,
         )
 
+    with pytest.raises(ValueError, match="repo_id"):
+        PinnedHubParquetSource(
+            repo_id=r"NoeFlandre\atlas-fixture",
+            revision=SOURCE_REVISION,
+            path="data/polygons.parquet",
+            size_bytes=7,
+        )
 
-def test_projection_reads_only_the_requested_column_and_row_group() -> None:
+
+def _chunk_span(column: pq.ColumnChunkMetaData) -> tuple[int, int]:
+    start = (
+        column.dictionary_page_offset
+        if column.has_dictionary_page
+        else column.data_page_offset
+    )
+    return start, start + column.total_compressed_size - 1
+
+
+def _range_span(request: Request) -> tuple[int, int]:
+    range_header = request.get_header("Range")
+    assert range_header is not None
+    match = re.fullmatch(r"bytes=(\d+)-(\d+)", range_header)
+    assert match is not None
+    start, end = (int(value) for value in match.groups())
+    return start, end
+
+
+def _overlaps(first: tuple[int, int], second: tuple[int, int]) -> bool:
+    return first[0] <= second[1] and second[0] <= first[1]
+
+
+def test_projection_returns_the_selected_column_of_the_requested_row_group() -> None:
+    rows_per_group = 1_000
+    row_count = 3 * rows_per_group
     buffer = BytesIO()
     pq.write_table(
         pa.table(
             {
-                "selected": ["a", "b", "c", "d"],
-                "unselected": [1, 2, 3, 4],
+                "selected": [f"id-{index:05d}" for index in range(row_count)],
+                "unselected": [f"{index:08d}" * 128 for index in range(row_count)],
             }
         ),
         buffer,
-        row_group_size=2,
+        row_group_size=rows_per_group,
         compression="NONE",
+        use_dictionary=False,
     )
     payload = buffer.getvalue()
+    group = pq.ParquetFile(BytesIO(payload)).metadata.row_group(1)
+    chunks = {
+        group.column(index).path_in_schema: _chunk_span(group.column(index))
+        for index in range(group.num_columns)
+    }
     source = _source(payload)
     server = FakeRangeServer(payload)
 
@@ -256,5 +310,47 @@ def test_projection_reads_only_the_requested_column_and_row_group() -> None:
     )
 
     assert table.schema.names == ["selected"]
-    assert table.to_pylist() == [{"selected": "c"}, {"selected": "d"}]
+    assert table.column("selected").to_pylist() == [
+        f"id-{index:05d}" for index in range(rows_per_group, 2 * rows_per_group)
+    ]
+    fetched = [_range_span(request) for request in server.requests]
+    assert any(_overlaps(span, chunks["selected"]) for span in fetched)
+    assert not any(_overlaps(span, chunks["unselected"]) for span in fetched)
+
+
+def test_projection_rejects_a_missing_source_column() -> None:
+    buffer = BytesIO()
+    pq.write_table(pa.table({"selected": ["a"]}), buffer, compression="NONE")
+    payload = buffer.getvalue()
+    source = _source(payload)
+    server = FakeRangeServer(payload)
+
+    with pytest.raises(ValueError, match="unknown projection"):
+        read_parquet_row_group(
+            source,
+            row_group_index=0,
+            columns=("missing",),
+            max_bytes=len(payload) * 4,
+            opener=server,
+        )
+
     assert server.requests
+
+
+def test_projection_rejects_an_ambiguous_duplicate_source_column() -> None:
+    buffer = BytesIO()
+    duplicate_names = pa.Table.from_arrays(
+        [pa.array(["first"]), pa.array(["second"])], names=["key", "key"]
+    )
+    pq.write_table(duplicate_names, buffer, compression="NONE")
+    payload = buffer.getvalue()
+    source = _source(payload)
+
+    with pytest.raises(ValueError, match="ambiguous projection"):
+        read_parquet_row_group(
+            source,
+            row_group_index=0,
+            columns=("key",),
+            max_bytes=len(payload) * 4,
+            opener=FakeRangeServer(payload),
+        )

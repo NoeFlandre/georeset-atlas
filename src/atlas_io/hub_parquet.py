@@ -1,15 +1,17 @@
 import operator
 import re
 from collections.abc import Buffer, Callable, Iterable
+from http.client import HTTPMessage
 from io import SEEK_CUR, SEEK_END, SEEK_SET, RawIOBase
 from typing import Protocol
+from urllib.error import HTTPError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from atlas_domain.sources import PinnedHubParquetSource
+from atlas_domain.sources import PinnedHubParquetSource, validate_pinned_file
 
 
 class ByteBudgetExceeded(OSError):
@@ -20,8 +22,12 @@ class RangeProtocolError(OSError):
     """Raised when a server response does not match the requested byte range."""
 
 
+class FileSizeProtocolError(OSError):
+    """Raised when a HEAD response cannot pin the size of a Hub file."""
+
+
 class _Headers(Protocol):
-    def get(self, name: str, default: str | None = None, /) -> str | None: ...
+    def get(self, name: str, /) -> str | None: ...
 
 
 class _Response(Protocol):
@@ -31,18 +37,89 @@ class _Response(Protocol):
     @property
     def headers(self) -> _Headers: ...
 
-    def read(self, size: int = -1) -> bytes: ...
+    def read(self, size: int = -1, /) -> bytes: ...
 
     def close(self) -> None: ...
 
 
-_Opener = Callable[[Request], _Response]
+HubOpener = Callable[[Request], _Response]
+DEFAULT_HUB_TIMEOUT_SECONDS = 30.0
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+def _open_head_without_redirect(request: Request) -> _Response:
+    opener = build_opener(_NoRedirect())
+    try:
+        return opener.open(request, timeout=DEFAULT_HUB_TIMEOUT_SECONDS)
+    except HTTPError as response:
+        return response
+
+
+def _open_range(request: Request) -> _Response:
+    return urlopen(request, timeout=DEFAULT_HUB_TIMEOUT_SECONDS)
+
+
+def _hub_file_url(repo_id: str, revision: str, path: str) -> str:
+    repo = quote(repo_id, safe="/")
+    file_path = quote(path, safe="/")
+    return f"https://huggingface.co/datasets/{repo}/resolve/{revision}/{file_path}"
 
 
 def _source_url(source: PinnedHubParquetSource) -> str:
-    repo_id = quote(source.repo_id, safe="/")
-    path = quote(source.path, safe="/")
-    return f"https://huggingface.co/datasets/{repo_id}/resolve/{source.revision}/{path}"
+    return _hub_file_url(source.repo_id, source.revision, source.path)
+
+
+def resolve_hub_file_size(
+    repo_id: str,
+    revision: str,
+    path: str,
+    *,
+    opener: HubOpener | None = None,
+) -> int:
+    validate_pinned_file(repo_id, revision, path)
+    request = Request(
+        _hub_file_url(repo_id, revision, path),
+        method="HEAD",
+        headers={"Accept-Encoding": "identity"},
+    )
+    response = (opener or _open_head_without_redirect)(request)
+    try:
+        if response.status in {301, 302, 303, 307, 308}:
+            linked_size = response.headers.get("X-Linked-Size")
+            if linked_size is None or not linked_size.isdecimal():
+                raise FileSizeProtocolError("HEAD redirect has no exact X-Linked-Size")
+            size = int(linked_size)
+            if size <= 0:
+                raise FileSizeProtocolError("HEAD redirect has an empty file size")
+            return size
+        if response.status != 200:
+            raise FileSizeProtocolError(
+                f"HEAD request returned HTTP {response.status}; expected 200"
+            )
+        content_encoding = response.headers.get("Content-Encoding")
+        if content_encoding not in {None, "identity"}:
+            raise FileSizeProtocolError("HEAD response used a content encoding")
+        content_length = response.headers.get("Content-Length")
+        if content_length is None or not content_length.isdecimal():
+            raise FileSizeProtocolError("HEAD response has no exact Content-Length")
+        size = int(content_length)
+        if size <= 0:
+            raise FileSizeProtocolError("pinned Hub file is empty")
+        return size
+    finally:
+        response.close()
 
 
 class HubParquetRangeReader(RawIOBase):
@@ -51,7 +128,7 @@ class HubParquetRangeReader(RawIOBase):
         source: PinnedHubParquetSource,
         *,
         max_bytes: int,
-        opener: _Opener = urlopen,
+        opener: HubOpener | None = None,
     ) -> None:
         super().__init__()
         if (
@@ -123,7 +200,8 @@ class HubParquetRangeReader(RawIOBase):
                 "Range": f"bytes={start}-{end}",
             },
         )
-        response = self._opener(request)
+        open_request = self._opener or _open_range
+        response = open_request(request)
         try:
             self._validate_response(response, start, end, requested)
             body = response.read(requested)
@@ -193,7 +271,7 @@ def read_parquet_row_group(
     row_group_index: int,
     columns: Iterable[str],
     max_bytes: int,
-    opener: _Opener = urlopen,
+    opener: HubOpener | None = None,
 ) -> pa.Table:
     if isinstance(row_group_index, bool) or not isinstance(row_group_index, int):
         raise TypeError("row_group_index must be an integer")
@@ -209,4 +287,16 @@ def read_parquet_row_group(
         parquet_file = pq.ParquetFile(reader)
         if row_group_index >= parquet_file.metadata.num_row_groups:
             raise IndexError(f"row group {row_group_index} does not exist")
-        return parquet_file.read_row_group(row_group_index, columns=list(column_names))
+        available_names = parquet_file.schema_arrow.names
+        unknown = sorted(set(column_names) - set(available_names))
+        if unknown:
+            raise ValueError(f"unknown projection column(s): {', '.join(unknown)}")
+        ambiguous = sorted(
+            name for name in set(column_names) if available_names.count(name) > 1
+        )
+        if ambiguous:
+            raise ValueError(f"ambiguous projection column(s): {', '.join(ambiguous)}")
+        table = parquet_file.read_row_group(row_group_index, columns=list(column_names))
+        if table.column_names != list(column_names):
+            raise ValueError("projected schema does not match requested columns")
+        return table
