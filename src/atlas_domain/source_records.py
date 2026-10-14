@@ -72,7 +72,7 @@ def description_text_for_label(label: _Record, source_record: _Record) -> str:
     split_status = _required_value(source_record, "split_status", "source_record")
     if not isinstance(split_status, str):
         raise DataJoinError("source_record.split_status must be a string")
-    if split_status in {"unsupported", "not_detected"}:
+    if split_status in {"unsupported", "unsupported_language", "not_detected"}:
         if sentence_index != 0:
             raise DataJoinError(
                 "unsplit description text only supports sentence_index 0"

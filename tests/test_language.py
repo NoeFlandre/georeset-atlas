@@ -119,12 +119,12 @@ def test_special_language_codes_keep_provenance_and_ignore_ordinary_mappings(
 
 
 @pytest.mark.parametrize("raw_code", ["und-Latn", "mul-Latn", "zxx-Latn", "mis-Latn"])
-def test_script_qualified_special_codes_remain_special(raw_code: str) -> None:
+def test_special_status_requires_the_exact_raw_code(raw_code: str) -> None:
     result = resolve_language(
         raw_code,
         scheme=ISO_STYLE,
         mapping_version=MAPPING_VERSION,
-        entries={(ISO_STYLE, raw_code, MAPPING_VERSION): "en"},
+        entries=MAPPING_ENTRIES,
     )
 
     assert result.raw_code == raw_code
@@ -132,7 +132,7 @@ def test_script_qualified_special_codes_remain_special(raw_code: str) -> None:
     assert result.mapping_version == MAPPING_VERSION
     assert result.script == "Latn"
     assert result.public_code is None
-    assert result.status == "special"
+    assert result.status == "unresolved"
 
 
 def test_hyphen_script_subtag_does_not_alias_underscore_mapping_keys() -> None:

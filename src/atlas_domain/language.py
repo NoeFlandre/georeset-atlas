@@ -23,10 +23,6 @@ class LanguageResolution:
     status: LanguageStatus
 
 
-def _primary_subtag(raw_code: str) -> str:
-    return re.split(r"[-_]", raw_code, maxsplit=1)[0]
-
-
 def _script_from_code(raw_code: str) -> str | None:
     for part in re.split(r"[-_]", raw_code)[1:]:
         if len(part) == 1:
@@ -53,7 +49,7 @@ def resolve_language(
             public_code=None,
             status="missing",
         )
-    if _primary_subtag(raw_code) in SPECIAL_LANGUAGE_CODES:
+    if raw_code in SPECIAL_LANGUAGE_CODES:
         return LanguageResolution(
             raw_code=raw_code,
             scheme=scheme,

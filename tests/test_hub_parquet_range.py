@@ -15,7 +15,9 @@ from atlas_domain.sources import PinnedHubParquetSource
 from atlas_io.hub_parquet import (
     ByteBudgetExceeded,
     HubParquetRangeReader,
+    ParquetReadStats,
     RangeProtocolError,
+    iter_parquet_file,
     read_parquet_row_group,
 )
 
@@ -316,6 +318,57 @@ def test_projection_returns_the_selected_column_of_the_requested_row_group() -> 
     fetched = [_range_span(request) for request in server.requests]
     assert any(_overlaps(span, chunks["selected"]) for span in fetched)
     assert not any(_overlaps(span, chunks["unselected"]) for span in fetched)
+
+
+def test_file_iterator_reads_and_releases_one_row_group_at_a_time() -> None:
+    rows_per_group = 100
+    row_count = rows_per_group * 3
+    buffer = BytesIO()
+    pq.write_table(
+        pa.table(
+            {
+                "selected": [f"id-{index:05d}" for index in range(row_count)],
+                "unselected": [f"{index:08d}" * 128 for index in range(row_count)],
+            }
+        ),
+        buffer,
+        row_group_size=rows_per_group,
+        compression="NONE",
+        use_dictionary=False,
+    )
+    payload = buffer.getvalue()
+    source = _source(payload)
+    server = FakeRangeServer(payload)
+    stats = ParquetReadStats()
+    stream = iter_parquet_file(
+        source,
+        max_bytes=len(payload) * 4,
+        opener=server,
+        stats=stats,
+    )
+
+    first = next(stream)
+
+    assert stats.row_groups == 3
+    assert first.num_rows == rows_per_group
+    assert first.column_names == ["selected", "unselected"]
+    first_group = pq.ParquetFile(BytesIO(payload)).metadata.row_group(0)
+    first_group_start = min(
+        first_group.column(index).data_page_offset
+        for index in range(first_group.num_columns)
+    )
+    assert stats.range_bytes > 0
+    assert stats.range_bytes < len(payload)
+    assert any(
+        _overlaps(_range_span(request), (first_group_start, len(payload) - 1))
+        for request in server.requests
+    )
+
+    second = next(stream)
+
+    assert second.num_rows == rows_per_group
+    assert stats.range_bytes > 0
+    stream.close()
 
 
 def test_projection_rejects_a_missing_source_column() -> None:

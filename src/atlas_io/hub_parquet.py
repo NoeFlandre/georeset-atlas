@@ -1,6 +1,7 @@
 import operator
 import re
-from collections.abc import Buffer, Callable, Iterable
+from collections.abc import Buffer, Callable, Generator, Iterable
+from dataclasses import dataclass
 from http.client import HTTPMessage
 from io import SEEK_CUR, SEEK_END, SEEK_SET, RawIOBase
 from typing import Protocol
@@ -44,6 +45,12 @@ class _Response(Protocol):
 
 HubOpener = Callable[[Request], _Response]
 DEFAULT_HUB_TIMEOUT_SECONDS = 30.0
+
+
+@dataclass(slots=True)
+class ParquetReadStats:
+    row_groups: int = 0
+    range_bytes: int = 0
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -300,3 +307,47 @@ def read_parquet_row_group(
         if table.column_names != list(column_names):
             raise ValueError("projected schema does not match requested columns")
         return table
+
+
+def read_parquet_file(
+    source: PinnedHubParquetSource,
+    *,
+    max_bytes: int,
+    opener: HubOpener | None = None,
+) -> tuple[tuple[pa.Table, ...], int]:
+    stats = ParquetReadStats()
+    tables = tuple(
+        iter_parquet_file(
+            source,
+            max_bytes=max_bytes,
+            opener=opener,
+            stats=stats,
+        )
+    )
+    return tables, stats.range_bytes
+
+
+def iter_parquet_file(
+    source: PinnedHubParquetSource,
+    *,
+    max_bytes: int,
+    opener: HubOpener | None = None,
+    stats: ParquetReadStats | None = None,
+) -> Generator[pa.Table, None, None]:
+    read_stats = stats if stats is not None else ParquetReadStats()
+    read_stats.row_groups = 0
+    read_stats.range_bytes = 0
+    with HubParquetRangeReader(source, max_bytes=max_bytes, opener=opener) as reader:
+        try:
+            parquet_file = pq.ParquetFile(reader)
+            names = parquet_file.schema_arrow.names
+            ambiguous = sorted({name for name in names if names.count(name) > 1})
+            if ambiguous:
+                raise ValueError(f"ambiguous column(s): {', '.join(ambiguous)}")
+            read_stats.row_groups = parquet_file.metadata.num_row_groups
+            for index in range(read_stats.row_groups):
+                table = parquet_file.read_row_group(index, columns=names)
+                read_stats.range_bytes = reader.bytes_read
+                yield table
+        finally:
+            read_stats.range_bytes = reader.bytes_read

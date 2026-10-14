@@ -9,6 +9,7 @@ requires-python = ">=3.12"
 dependencies = ["pyarrow>=22.0"]
 
 [project.scripts]
+atlas-join = "atlas_io.joined_cli:main"
 atlas-shard = "atlas_io.shard_cli:main"
 
 [dependency-groups]
