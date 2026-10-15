@@ -3,7 +3,7 @@ import http.client
 import shutil
 import sys
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -12,9 +12,6 @@ import pyarrow as pa
 from atlas_domain.joined_outputs import (
     JoinedPartition,
     RowSource,
-    join_description_partition,
-    join_website_partition,
-    join_wiki_partition,
 )
 from atlas_domain.source_catalog import (
     SOURCE_CATALOG,
@@ -23,6 +20,11 @@ from atlas_domain.source_catalog import (
 )
 from atlas_domain.source_records import DataJoinError
 from atlas_domain.sources import PinnedHubParquetSource
+from atlas_io.disk_joined import (
+    build_description_partition,
+    build_website_partition,
+    build_wiki_partition,
+)
 from atlas_io.hub_parquet import (
     ByteBudgetExceeded,
     HubOpener,
@@ -59,36 +61,7 @@ class _InputTotals:
     range_bytes: int
 
 
-def _join_description(tables: Mapping[str, Rows]) -> JoinedPartition:
-    return join_description_partition(
-        label_rows=tables["labels"],
-        text_unit_rows=tables["text_units"],
-        polygon_rows=tables["polygons"],
-    )
-
-
-def _join_website(tables: Mapping[str, Rows]) -> JoinedPartition:
-    return join_website_partition(
-        label_rows=tables["labels"],
-        polygon_text_rows=tables["polygons_and_text"],
-    )
-
-
-def _join_wiki(tables: Mapping[str, Rows]) -> JoinedPartition:
-    return join_wiki_partition(
-        label_rows=tables["labels"],
-        sentence_rows=tables["text_units"],
-        document_rows=tables["documents"],
-        link_rows=tables["polygon_document_links"],
-        polygon_rows=tables["polygons"],
-    )
-
-
-_JOINS: Mapping[str, Callable[[Mapping[str, Rows]], JoinedPartition]] = {
-    "description": _join_description,
-    "website": _join_website,
-    "wiki": _join_wiki,
-}
+_SUPPORTED_SOURCE_IDS = frozenset({"description", "website", "wiki"})
 _OUTPUTS_BY_INPUT: Mapping[str, Mapping[str, tuple[str, ...]]] = {
     "description": {
         "labels": ("labels",),
@@ -248,7 +221,7 @@ def main(argv: Sequence[str] | None = None, *, opener: HubOpener | None = None) 
         source, labels_root = select_input_file(
             SOURCE_CATALOG, source_id=args.source, table="labels", path=args.labels
         )
-        if source.source_id not in _JOINS:
+        if source.source_id not in _SUPPORTED_SOURCE_IDS:
             raise ValueError(f"no joined partition is defined for {args.source!r}")
         companions = _companion_paths(source, labels_root, args.labels)
     except ValueError as error:
@@ -286,7 +259,31 @@ def main(argv: Sequence[str] | None = None, *, opener: HubOpener | None = None) 
                 f"range_bytes={stats.range_bytes}"
             )
         try:
-            return _JOINS[source.source_id](staged_tables)
+            if source.source_id == "description":
+                return build_description_partition(
+                    labels=staged_tables["labels"],
+                    text_units=staged_tables["text_units"],
+                    polygons=staged_tables["polygons"],
+                    workspace_path=directory / "description.sqlite",
+                )
+            if source.source_id == "website":
+                return build_website_partition(
+                    labels=staged_tables["labels"],
+                    polygons_and_text=staged_tables["polygons_and_text"],
+                    workspace_path=directory / "website.sqlite",
+                )
+            if source.source_id == "wiki":
+                return build_wiki_partition(
+                    labels=staged_tables["labels"],
+                    sentences=staged_tables["text_units"],
+                    documents=staged_tables["documents"],
+                    links=staged_tables["polygon_document_links"],
+                    polygons=staged_tables["polygons"],
+                    workspace_path=directory / "wiki.sqlite",
+                )
+            raise DataJoinError(
+                f"no disk-backed join is defined for {source.source_id!r}"
+            )
         except ValueError as error:
             raise DataJoinError(str(error)) from error
 

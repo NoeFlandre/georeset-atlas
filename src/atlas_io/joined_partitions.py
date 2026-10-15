@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from bisect import bisect_right
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -117,6 +118,35 @@ class StagedRows:
         raise IndexError(
             f"row index {index} is out of range for {metadata.num_rows} rows"
         )
+
+    def read_many(self, indices: Iterable[int]) -> list[Row]:
+        parquet_file = pq.ParquetFile(self._path)
+        metadata = parquet_file.metadata
+        normalized = [
+            normalize_row_index(index, metadata.num_rows) for index in indices
+        ]
+        if not normalized:
+            return []
+
+        group_starts: list[int] = []
+        next_start = 0
+        for group in range(metadata.num_row_groups):
+            group_starts.append(next_start)
+            next_start += metadata.row_group(group).num_rows
+
+        requests: dict[int, list[tuple[int, int]]] = {}
+        for result_index, row_index in enumerate(normalized):
+            group = bisect_right(group_starts, row_index) - 1
+            offset = row_index - group_starts[group]
+            requests.setdefault(group, []).append((result_index, offset))
+
+        results: list[Row] = [{} for _ in normalized]
+        for group, group_requests in sorted(requests.items()):
+            table = parquet_file.read_row_group(group)
+            for result_index, offset in group_requests:
+                results[result_index] = table.slice(offset, 1).to_pylist()[0]
+            del table
+        return results
 
     def __iter__(self) -> Iterator[Row]:
         parquet_file = pq.ParquetFile(self._path)

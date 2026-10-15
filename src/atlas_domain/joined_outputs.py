@@ -4,7 +4,7 @@ from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import islice
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeAlias
 
 from atlas_domain.occurrences import (
     description_occurrence_key,
@@ -21,6 +21,7 @@ from atlas_domain.source_records import (
 )
 
 Row = dict[str, Any]
+DescriptionAssociation: TypeAlias = tuple[str, str] | tuple[str, str, str, int | str]
 
 
 class RowSource(Protocol):
@@ -50,13 +51,13 @@ _TEXT_UNIT_RESERVED = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class JoinedPartition:
-    labels: tuple[Row, ...]
-    text_units: tuple[Row, ...]
+    labels: RowSource
+    text_units: RowSource
     polygon_records: RowSource
-    documents: tuple[Row, ...]
+    documents: RowSource
     status_counts: Mapping[str, int]
     raw_decision_counts: Mapping[str, int]
-    polygon_document_links: tuple[Row, ...] = ()
+    polygon_document_links: RowSource = ()
 
 
 def normalize_label_decision(raw_decision: object) -> str:
@@ -83,36 +84,31 @@ def join_description_partition(
     if iter(polygon_rows) is polygon_rows:
         polygon_rows = tuple(polygon_rows)
     seen_polygon_ids: set[str] = set()
-    polygon_ids_by_association: dict[tuple[object, ...], list[str]] = {}
+    polygon_ids_by_association: dict[DescriptionAssociation, list[str]] = {}
     for polygon in polygon_rows:
-        association = _description_association(polygon, "polygon")
-        polygon_id = _description_polygon_identifier(polygon)
-        _geometry(polygon, "polygon")
+        association, polygon_id = description_polygon_identity(polygon, "polygon")
         if polygon_id in seen_polygon_ids:
             raise DataJoinError(f"duplicate polygon_id {polygon_id!r}")
         seen_polygon_ids.add(polygon_id)
         polygon_ids_by_association.setdefault(association, []).append(polygon_id)
     texts_by_identity: dict[tuple[str, str], Mapping[str, Any]] = {}
     for text in text_unit_rows:
-        identity = (
-            _identifier(text, "description_identity", "text_unit"),
-            _identifier(text, "tag_key", "text_unit"),
-        )
+        identity = description_text_identity(text, "text_unit")
         _add_unique(texts_by_identity, identity, text, "description text unit")
     labels: list[Row] = []
     units: dict[tuple[str, str, int], Row] = {}
     for source_row_index, label in enumerate(label_rows):
-        identity = _identifier(label, "description_identity", "label")
-        tag_key = _identifier(label, "tag_key", "label")
-        text_row = texts_by_identity.get((identity, tag_key))
+        identity = description_text_identity(label, "label")
+        text_row = texts_by_identity.get(identity)
         if text_row is None:
             raise DataJoinError(
-                f"label has no description text unit for {identity!r} {tag_key!r}"
+                f"label has no description text unit for {identity[0]!r} "
+                f"{identity[1]!r}"
             )
         text = description_text_for_label(label, text_row)
-        key = description_occurrence_key(identity, tag_key, label["sentence_index"])
+        key = description_occurrence_key(*identity, label["sentence_index"])
         if key not in units:
-            association = _description_association(text_row, "text_unit")
+            association = description_association(text_row, "text_unit")
             polygon_ids = polygon_ids_by_association.get(association)
             if not polygon_ids:
                 raise DataJoinError(f"description text unit {key!r} has no polygons")
@@ -355,7 +351,7 @@ def _partition(
 def _description_polygon_identifier(polygon: Mapping[str, Any]) -> str:
     if "polygon_id" in polygon:
         return _identifier(polygon, "polygon_id", "polygon")
-    return _description_polygon_id(_description_association(polygon, "polygon"))
+    return _description_polygon_id(description_association(polygon, "polygon"))
 
 
 def _description_polygon_id(association: tuple[object, ...]) -> str:
@@ -416,10 +412,10 @@ def _website_full_text(polygon: Mapping[str, Any], field: str) -> str:
     return _string(polygon, f"{field}_text", "polygon_text")
 
 
-def _description_association(
+def description_association(
     record: Mapping[str, Any],
     name: str,
-) -> tuple[object, ...]:
+) -> DescriptionAssociation:
     if not isinstance(record, Mapping):
         raise DataJoinError(f"{name} must be a mapping")
     present = [field for field in _OSM_FIELDS if field in record]
@@ -439,6 +435,26 @@ def _description_association(
         _identifier(record, "osm_type", name),
         osm_id,
     )
+
+
+def description_text_identity(
+    record: Mapping[str, Any],
+    name: str,
+) -> tuple[str, str]:
+    return (
+        _identifier(record, "description_identity", name),
+        _identifier(record, "tag_key", name),
+    )
+
+
+def description_polygon_identity(
+    record: Mapping[str, Any],
+    name: str,
+) -> tuple[DescriptionAssociation, str]:
+    association = description_association(record, name)
+    polygon_id = _description_polygon_identifier(record)
+    _geometry(record, name)
+    return association, polygon_id
 
 
 def _reject_reserved(

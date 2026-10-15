@@ -809,3 +809,51 @@ def test_staged_rows_expose_the_exact_schema_of_their_groups(tmp_path: Path) -> 
     staged = stage_table_groups([group], tmp_path / "text_units.parquet")
 
     assert staged.schema_arrow.field("localized_descriptions").type == list_type
+
+
+def test_staged_rows_read_many_groups_row_groups_once_and_preserves_request_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "polygons.parquet"
+    staged = stage_table_groups(
+        [
+            pa.table({"polygon_id": ["a", "b"]}),
+            pa.table({"polygon_id": ["c", "d"]}),
+            pa.table({"polygon_id": ["e", "f"]}),
+        ],
+        path,
+    )
+    original_read_row_group = pq.ParquetFile.read_row_group
+    read_groups: list[int] = []
+
+    def record_read(
+        parquet_file: pq.ParquetFile, index: int, **options: Any
+    ) -> pa.Table:
+        read_groups.append(index)
+        return original_read_row_group(parquet_file, index, **options)
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", record_read)
+
+    rows = staged.read_many([4, 0, 4, 2, 3])
+
+    assert [row["polygon_id"] for row in rows] == ["e", "a", "e", "c", "d"]
+    assert read_groups == [0, 1, 2]
+    assert staged.read_many([]) == []
+
+
+@pytest.mark.parametrize(
+    ("indices", "error"),
+    [([6], IndexError), ([-7], IndexError), ([1.5], TypeError)],
+)
+def test_staged_rows_read_many_rejects_invalid_indices(
+    tmp_path: Path,
+    indices: list[Any],
+    error: type[Exception],
+) -> None:
+    staged = stage_table_groups(
+        [pa.table({"polygon_id": ["a", "b"]})], tmp_path / "polygons.parquet"
+    )
+
+    with pytest.raises(error):
+        staged.read_many(indices)
