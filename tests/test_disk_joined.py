@@ -646,6 +646,12 @@ def test_wiki_indexed_join_preserves_batch_occurrences_and_native_order(
         "text_unit_key": "sentence-a",
         "source_url": "https://example.test/first",
         "polygon_ids": ["polygon-3", "polygon-1"],
+        "raw_language_code": "en-GB",
+        "language_code": None,
+        "language_scheme": "wikimedia_project_code",
+        "language_mapping_version": "atlas-language-crosswalk-1.0.0",
+        "language_script": None,
+        "language_mapping_status": "unresolved",
     }
     assert text_units[1]["sentence_revision"] == 7
     assert text_units[1]["source_url"] == "https://example.test/second"

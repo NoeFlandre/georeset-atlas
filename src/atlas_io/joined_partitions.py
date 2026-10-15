@@ -64,7 +64,12 @@ _TABLE_TYPES: Mapping[str, Mapping[str, pa.DataType]] = {
     "text_units": {
         "text": pa.string(),
         "source_url": pa.string(),
+        "language_code": pa.string(),
         "raw_language_code": pa.string(),
+        "language_scheme": pa.string(),
+        "language_script": pa.string(),
+        "language_mapping_version": pa.string(),
+        "language_mapping_status": pa.string(),
         "polygon_ids": pa.list_(pa.string()),
     },
     "polygon_records": {

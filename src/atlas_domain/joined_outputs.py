@@ -6,6 +6,12 @@ from dataclasses import dataclass
 from itertools import islice
 from typing import Any, Protocol, TypeAlias
 
+from atlas_domain.language import (
+    GLOTLID_ISO639_3_SCRIPT,
+    LINGUA_ISO639_3,
+    WIKIMEDIA_PROJECT_CODE,
+    resolve_packaged_language,
+)
 from atlas_domain.occurrences import (
     description_occurrence_key,
     website_occurrence_key,
@@ -40,6 +46,10 @@ _STATUS_BY_DECISION = {
     "skipped_unsplit": "skipped",
 }
 RAW_DECISIONS = tuple(_STATUS_BY_DECISION)
+_DESCRIPTION_SCHEME_BY_REASON = {
+    "detected": LINGUA_ISO639_3,
+    "fallback_glotlid_v3": GLOTLID_ISO639_3_SCRIPT,
+}
 _OSM_FIELDS = ("source_pbf", "osm_type", "osm_id")
 _LABEL_RESERVED = frozenset(
     {"text_unit_key", "source_row_index", "raw_decision", "status"}
@@ -113,12 +123,24 @@ def join_description_partition(
             if not polygon_ids:
                 raise DataJoinError(f"description text unit {key!r} has no polygons")
             _reject_reserved(text_row, _TEXT_UNIT_RESERVED, "description text unit")
+            language_field = (
+                "language_code" if "language_code" in text_row else "raw_language_code"
+            )
+            raw_language = (
+                _nullable_string(text_row, language_field, "text_unit")
+                if language_field in text_row
+                else None
+            )
             units[key] = {
                 **text_row,
                 "text_unit_key": key,
                 "sentence_index": key[2],
                 "text": text,
                 "polygon_ids": list(polygon_ids),
+                **_language_fields(
+                    raw_language,
+                    _DESCRIPTION_SCHEME_BY_REASON.get(text_row.get("reason")),
+                ),
             }
         labels.append(_label_row(label, source_row_index, key))
     referenced = {
@@ -164,18 +186,22 @@ def join_website_partition(
                 "polygon_ids": [polygon_id],
             }
             if _is_native_website_row(polygon, field):
-                unit["language"] = _string(polygon, f"{field}_language", "polygon_text")
+                raw_language = _nullable_string(
+                    polygon, f"{field}_language", "polygon_text"
+                )
+                unit["language"] = raw_language
                 unit["sentence_status"] = _string(
                     polygon, f"{field}_sentence_status", "polygon_text"
                 )
             else:
+                raw_language = _nullable_string(
+                    polygon, "raw_language_code", "polygon_text"
+                )
                 unit.update(
                     decision=_string(polygon, "decision", "polygon_text"),
                     source_url=_string(polygon, "source_url", "polygon_text"),
-                    raw_language_code=_string(
-                        polygon, "raw_language_code", "polygon_text"
-                    ),
                 )
+            unit.update(_language_fields(raw_language, GLOTLID_ISO639_3_SCRIPT))
             units[key] = unit
         labels.append(_label_row(label, source_row_index, key))
     referenced = {unit["polygon_id"] for unit in units.values()}
@@ -215,7 +241,7 @@ def join_wiki_partition(
             "text" if "text" in sentence else "sentence_text",
             "sentence",
         )
-        _string(
+        _nullable_string(
             sentence,
             "language" if "language" in sentence else "raw_language_code",
             "sentence",
@@ -263,7 +289,7 @@ def join_wiki_partition(
                 "text" if "text" in sentence else "sentence_text",
                 "sentence",
             )
-            language = _string(
+            language = _nullable_string(
                 sentence,
                 "language" if "language" in sentence else "raw_language_code",
                 "sentence",
@@ -283,6 +309,7 @@ def join_wiki_partition(
                 "language": language,
                 "source_url": source_url,
                 "polygon_ids": polygon_ids,
+                **_language_fields(language, WIKIMEDIA_PROJECT_CODE),
             }
         labels.append(_label_row(label, source_row_index, key))
     referenced_documents = {
@@ -325,6 +352,18 @@ def _label_row(label: Mapping[str, Any], source_row_index: int, key: object) -> 
         "source_row_index": source_row_index,
         "raw_decision": raw_decision,
         "status": status,
+    }
+
+
+def _language_fields(raw_code: str | None, scheme: str | None) -> Row:
+    resolution = resolve_packaged_language(raw_code, scheme=scheme)
+    return {
+        "language_code": resolution.public_code,
+        "raw_language_code": resolution.raw_code,
+        "language_scheme": resolution.scheme,
+        "language_mapping_version": resolution.mapping_version,
+        "language_script": resolution.script,
+        "language_mapping_status": resolution.status,
     }
 
 
@@ -485,6 +524,13 @@ def _string(record: object, field: str, name: str) -> str:
     value = _field(record, field, name)
     if not isinstance(value, str):
         raise DataJoinError(f"{name}.{field} must be a string")
+    return value
+
+
+def _nullable_string(record: object, field: str, name: str) -> str | None:
+    value = _field(record, field, name)
+    if value is not None and not isinstance(value, str):
+        raise DataJoinError(f"{name}.{field} must be a string or null")
     return value
 
 

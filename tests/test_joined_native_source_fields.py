@@ -493,7 +493,7 @@ def test_native_description_polygon_records_keep_exact_geometry_bytes() -> None:
 def test_native_description_text_units_keep_raw_language_and_osm_provenance() -> None:
     unit = _units_by_key(_join_native_description())[("description-way-1", "name", 0)]
 
-    assert unit["language_code"] == "en-GB"
+    assert unit["raw_language_code"] == "en-GB"
     assert unit["original_text"] == "Kabul bazaar. Open daily."
     assert unit["split_status"] == "split"
     assert (unit["source_pbf"], unit["osm_type"], unit["osm_id"]) == (PBF, "way", 1)
