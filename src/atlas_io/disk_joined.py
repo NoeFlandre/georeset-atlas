@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 
+import pyarrow as pa
+
 from atlas_domain import joined_outputs
 from atlas_domain.joined_outputs import (
     STATUSES,
@@ -27,7 +29,7 @@ from atlas_domain.occurrences import (
 )
 from atlas_domain.source_records import DataJoinError, description_text_for_label
 from atlas_io.disk_join_index import DiskJoinIndex, DiskMembershipSet
-from atlas_io.joined_partitions import StagedRows
+from atlas_io.joined_partitions import StagedRows, _schema_with_source
 
 _BATCH_ROWS = 512
 _TEXT_KEY = "description-text-key"
@@ -204,6 +206,15 @@ def _record_label_batch(
 class _DescriptionLabels:
     def __init__(self, labels: StagedRows) -> None:
         self._labels = labels
+        self.output_schema = _schema_with_source(
+            labels.schema_arrow,
+            {
+                "source_row_index": pa.int64(),
+                "raw_decision": pa.string(),
+                "status": pa.string(),
+            },
+            excluded={"decision"},
+        )
 
     def __len__(self) -> int:
         return len(self._labels)
@@ -241,6 +252,14 @@ class _DescriptionTextUnits:
         self._labels = labels
         self._polygons = polygons
         self._count = count
+        self.output_schema = _schema_with_source(
+            text_units.schema_arrow,
+            {
+                "sentence_index": pa.int64(),
+                "text": pa.string(),
+                "polygon_ids": pa.list_(pa.string()),
+            },
+        )
 
     def __len__(self) -> int:
         return self._count
@@ -308,6 +327,9 @@ class _DescriptionPolygons:
         self._workspace_path = workspace_path
         self._polygons = polygons
         self._count = count
+        self.output_schema = _schema_with_source(
+            polygons.schema_arrow, {"polygon_id": pa.string()}
+        )
 
     def __len__(self) -> int:
         return self._count
@@ -500,6 +522,15 @@ def _record_website_label_batch(
 class _WebsiteLabels:
     def __init__(self, labels: StagedRows) -> None:
         self._labels = labels
+        self.output_schema = _schema_with_source(
+            labels.schema_arrow,
+            {
+                "source_row_index": pa.int64(),
+                "raw_decision": pa.string(),
+                "status": pa.string(),
+            },
+            excluded={"decision"},
+        )
 
     def __len__(self) -> int:
         return len(self._labels)
@@ -531,6 +562,30 @@ class _WebsiteTextUnits:
         self._labels = labels
         self._polygons = polygons
         self._count = count
+        source_names = set(polygons.schema_arrow.names)
+        extra_fields = {
+            "polygon_id": pa.string(),
+            "field": pa.string(),
+            "sentence_index": pa.int64(),
+            "text": pa.string(),
+            "full_text": pa.string(),
+            "polygon_ids": pa.list_(pa.string()),
+        }
+        if any(name.endswith("_sentence_status") for name in source_names):
+            extra_fields.update(language=pa.string(), sentence_status=pa.string())
+        if {"decision", "source_url"}.issubset(source_names):
+            extra_fields.update(decision=pa.string(), source_url=pa.string())
+        extra_fields.update(
+            language_code=pa.string(),
+            raw_language_code=pa.string(),
+            language_scheme=pa.string(),
+            language_mapping_version=pa.string(),
+            language_script=pa.string(),
+            language_mapping_status=pa.string(),
+        )
+        self.output_schema = pa.schema(
+            [pa.field(name, data_type) for name, data_type in extra_fields.items()]
+        )
 
     def __len__(self) -> int:
         return self._count
@@ -568,6 +623,7 @@ class _WebsitePolygons:
         self._workspace_path = workspace_path
         self._polygons = polygons
         self._count = count
+        self.output_schema = _schema_with_source(polygons.schema_arrow, {})
 
     def __len__(self) -> int:
         return self._count
@@ -938,6 +994,15 @@ class _WikiLabels:
     def __init__(self, labels: StagedRows, count: int) -> None:
         self._labels = labels
         self._count = count
+        self.output_schema = _schema_with_source(
+            labels.schema_arrow,
+            {
+                "source_row_index": pa.int64(),
+                "raw_decision": pa.string(),
+                "status": pa.string(),
+            },
+            excluded={"decision"},
+        )
 
     def __len__(self) -> int:
         return self._count
@@ -977,6 +1042,24 @@ class _WikiTextUnits:
         self._links = links
         self._polygons = polygons
         self._count = count
+        self.output_schema = _schema_with_source(
+            sentences.schema_arrow,
+            {
+                "sentence_id": pa.string(),
+                "document_id": pa.string(),
+                "project": pa.string(),
+                "text": pa.string(),
+                "language": pa.string(),
+                "source_url": pa.string(),
+                "polygon_ids": pa.list_(pa.string()),
+                "language_code": pa.string(),
+                "raw_language_code": pa.string(),
+                "language_scheme": pa.string(),
+                "language_mapping_version": pa.string(),
+                "language_script": pa.string(),
+                "language_mapping_status": pa.string(),
+            },
+        )
 
     def __len__(self) -> int:
         return self._count
@@ -1027,6 +1110,7 @@ class _WikiSelectedRows:
         self._source = source
         self._selection_table = selection_table
         self._count = count
+        self.output_schema = _schema_with_source(source.schema_arrow, {})
 
     def __len__(self) -> int:
         return self._count

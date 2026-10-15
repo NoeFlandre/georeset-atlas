@@ -26,6 +26,7 @@ MANIFEST_VERSION = 1
 PARQUET_COMPRESSION = "zstd"
 OUTPUT_BATCH_ROWS = 10_000
 OUTPUT_BATCH_BYTES = 1024 * 1024
+_MAX_CACHED_ROW_GROUP_BYTES = 192 * 1024 * 1024
 OUTPUT_TABLES = (
     "labels",
     "text_units",
@@ -91,8 +92,6 @@ _TABLE_TYPES: Mapping[str, Mapping[str, pa.DataType]] = {
         "input_revision": pa.string(),
     },
 }
-
-
 SchemaProvider = Callable[[], Mapping[str, pa.Schema]]
 
 
@@ -103,6 +102,7 @@ class JoinedPartitionConflictError(RuntimeError):
 class StagedRows:
     def __init__(self, path: Path) -> None:
         self._path = path
+        self._row_group_cache: tuple[int, pa.Table, int] | None = None
 
     @property
     def schema_arrow(self) -> pa.Schema:
@@ -148,9 +148,24 @@ class StagedRows:
 
         results: list[Row] = [{} for _ in normalized]
         for group, group_requests in sorted(requests.items()):
-            table = parquet_file.read_row_group(group)
-            for result_index, offset in group_requests:
-                results[result_index] = table.slice(offset, 1).to_pylist()[0]
+            cache = self._row_group_cache
+            if cache is not None and cache[2] > _MAX_CACHED_ROW_GROUP_BYTES:
+                self._row_group_cache = None
+                cache = None
+            if cache is not None and cache[0] == group:
+                table = cache[1]
+            else:
+                self._row_group_cache = None
+                table = parquet_file.read_row_group(group)
+                table_bytes = table.get_total_buffer_size()
+                if table_bytes <= _MAX_CACHED_ROW_GROUP_BYTES:
+                    self._row_group_cache = (group, table, table_bytes)
+            for start in range(0, len(group_requests), 128):
+                chunk = group_requests[start : start + 128]
+                offsets = pa.array([offset for _, offset in chunk], type=pa.int64())
+                rows = table.take(offsets).to_pylist()
+                for (result_index, _), row in zip(chunk, rows, strict=True):
+                    results[result_index] = row
             del table
         return results
 
@@ -444,15 +459,23 @@ def _share_table(output_dir: Path, staged: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _table_schema(table: str, rows: RowSource, source: pa.Schema | None) -> pa.Schema:
+    output_schema = getattr(rows, "output_schema", None)
+    if output_schema is not None:
+        if not isinstance(output_schema, pa.Schema):
+            raise TypeError("row source output_schema must be an Arrow schema")
+        return output_schema
     declared = _TABLE_TYPES[table]
     source_types: dict[str, pa.DataType] = (
         {} if source is None else {field.name: field.type for field in source}
     )
-    names: dict[str, None] = {} if len(rows) else dict.fromkeys(declared)
-    for row in rows:
-        for name in row:
-            if name != _ROW_KEY_FIELD:
-                names.setdefault(name)
+    if not len(rows):
+        names = dict.fromkeys(declared)
+    else:
+        names = {}
+        for row in rows:
+            for name in row:
+                if name != _ROW_KEY_FIELD:
+                    names.setdefault(name)
     return pa.schema(
         [
             pa.field(name, _column_type(name, declared, source_types, rows))
@@ -476,6 +499,26 @@ def _column_type(
         if value is not None:
             return pa.array([value]).type
     return pa.null()
+
+
+def _schema_with_source(
+    source: pa.Schema,
+    added: Mapping[str, pa.DataType],
+    *,
+    excluded: Collection[str] = (),
+) -> pa.Schema:
+    excluded_names = set(excluded) | {_ROW_KEY_FIELD}
+    fields = {field.name: field for field in source if field.name not in excluded_names}
+    for name, data_type in added.items():
+        if name == _ROW_KEY_FIELD:
+            continue
+        original = fields.get(name)
+        fields[name] = (
+            pa.field(name, data_type)
+            if original is None
+            else original.with_type(data_type)
+        )
+    return pa.schema(list(fields.values()))
 
 
 def _record_batches(rows: RowSource, schema: pa.Schema) -> Iterator[pa.RecordBatch]:

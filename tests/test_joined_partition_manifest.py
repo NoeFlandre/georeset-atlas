@@ -9,15 +9,22 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import atlas_io.joined_partitions as joined_partitions
 from atlas_domain.joined_outputs import (
     JoinedPartition,
     join_description_partition,
     join_wiki_partition,
 )
 from atlas_domain.source_records import DataJoinError
+from atlas_io.disk_joined import (
+    _DescriptionLabels,
+    _WebsitePolygons,
+    _WikiSelectedRows,
+)
 from atlas_io.joined_partitions import (
     JoinedPartitionConflictError,
     JoinedPartitionResult,
+    _table_schema,
     stage_table_groups,
     write_joined_partition,
 )
@@ -881,3 +888,246 @@ def test_staged_rows_read_many_rejects_invalid_indices(
 
     with pytest.raises(error):
         staged.read_many(indices)
+
+
+def test_staged_rows_reuses_a_cached_row_group_across_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "polygons.parquet"
+    staged = stage_table_groups([pa.table({"polygon_id": ["a", "b", "c"]})], path)
+    original_read_row_group = pq.ParquetFile.read_row_group
+    read_groups: list[int] = []
+
+    def record_read(
+        parquet_file: pq.ParquetFile, index: int, **options: Any
+    ) -> pa.Table:
+        read_groups.append(index)
+        return original_read_row_group(parquet_file, index, **options)
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", record_read)
+
+    rows = [staged.read_many([index])[0]["polygon_id"] for index in (1, 0, 2, 1)]
+
+    assert rows == ["b", "a", "c", "b"]
+    assert read_groups == [0]
+
+
+def test_staged_rows_releases_row_groups_above_its_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        joined_partitions, "_MAX_CACHED_ROW_GROUP_BYTES", 0, raising=False
+    )
+    path = tmp_path / "polygons.parquet"
+    staged = stage_table_groups([pa.table({"polygon_id": ["a", "b", "c"]})], path)
+    original_read_row_group = pq.ParquetFile.read_row_group
+    read_groups: list[int] = []
+
+    def record_read(
+        parquet_file: pq.ParquetFile, index: int, **options: Any
+    ) -> pa.Table:
+        read_groups.append(index)
+        return original_read_row_group(parquet_file, index, **options)
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", record_read)
+
+    assert staged.read_many([1])[0]["polygon_id"] == "b"
+    assert staged.read_many([1])[0]["polygon_id"] == "b"
+    assert read_groups == [0, 0]
+
+
+def test_staged_rows_materializes_group_requests_in_bounded_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RecordingTable:
+        def __init__(self, table: pa.Table) -> None:
+            self._table = table
+            self.take_calls: list[pa.Array] = []
+
+        def get_total_buffer_size(self) -> int:
+            return self._table.get_total_buffer_size()
+
+        def take(self, offsets: pa.Array) -> pa.Table:
+            self.take_calls.append(offsets)
+            return self._table.take(offsets)
+
+        def slice(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("read_many must not slice rows individually")
+
+    path = tmp_path / "rows.parquet"
+    row_count = 19
+    staged = stage_table_groups([pa.table({"row_index": list(range(row_count))})], path)
+    original_read_row_group = pq.ParquetFile.read_row_group
+    wrapped_tables: list[RecordingTable] = []
+
+    def record_read(parquet_file: pq.ParquetFile, index: int, **options: Any) -> Any:
+        wrapped = RecordingTable(
+            original_read_row_group(parquet_file, index, **options)
+        )
+        wrapped_tables.append(wrapped)
+        return wrapped
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", record_read)
+    indices = [(index * 7) % row_count for index in range(257)]
+
+    rows = staged.read_many(indices)
+
+    assert [row["row_index"] for row in rows] == indices
+    assert len(wrapped_tables) == 1
+    take_calls = wrapped_tables[0].take_calls
+    assert [offsets.type for offsets in take_calls] == [pa.int64()] * 3
+    assert [offsets.to_pylist() for offsets in take_calls] == [
+        indices[:128],
+        indices[128:256],
+        indices[256:],
+    ]
+
+
+def test_schema_for_a_generic_lazy_source_keeps_later_only_fields() -> None:
+    rows = _SchemaSampleRows(
+        [
+            {"source_values": None, "text": "First."},
+            {"source_values": ["later"], "text": "Second.", "late_field": "kept"},
+        ]
+    )
+
+    schema = _table_schema(
+        "text_units", rows, pa.schema([("source_values", pa.list_(pa.string()))])
+    )
+
+    assert "late_field" in schema.names
+    assert schema.field("late_field").type == pa.string()
+
+
+def test_schema_for_a_generic_lazy_source_infers_after_null_first_value() -> None:
+    rows = _SchemaSampleRows(
+        [
+            {"optional_value": None},
+            {"optional_value": "available later"},
+        ]
+    )
+
+    schema = _table_schema(
+        "text_units", rows, pa.schema([("unrelated_source_column", pa.string())])
+    )
+
+    assert schema.field("optional_value").type == pa.string()
+
+
+def test_description_label_source_declares_native_and_derived_schema(
+    tmp_path: Path,
+) -> None:
+    labels = stage_table_groups(
+        [pa.table({"decision": ["yes"], "optional_native": [None]})],
+        tmp_path / "labels.parquet",
+    )
+    rows = _DescriptionLabels(labels)
+
+    schema = _table_schema("labels", rows, labels.schema_arrow)
+
+    assert schema.names == [
+        "optional_native",
+        "source_row_index",
+        "raw_decision",
+        "status",
+    ]
+    assert schema.field("optional_native").type == pa.null()
+    assert schema.field("source_row_index").type == pa.int64()
+    assert schema.field("raw_decision").type == pa.string()
+    assert schema.field("status").type == pa.string()
+
+
+def test_passthrough_lazy_sources_exclude_the_internal_row_key(
+    tmp_path: Path,
+) -> None:
+    staged = stage_table_groups(
+        [pa.table({"text_unit_key": ["internal"], "native_field": ["kept"]})],
+        tmp_path / "rows.parquet",
+    )
+    website_rows = _WebsitePolygons(tmp_path / "website.sqlite", staged, 1)
+    wiki_rows = _WikiSelectedRows(tmp_path / "wiki.sqlite", staged, "selected_rows", 1)
+
+    website_schema = _table_schema("polygon_records", website_rows, staged.schema_arrow)
+    wiki_schema = _table_schema("documents", wiki_rows, staged.schema_arrow)
+
+    assert website_schema.names == ["native_field"]
+    assert wiki_schema.names == ["native_field"]
+
+
+def test_schema_for_a_lazy_source_uses_explicit_typed_metadata() -> None:
+    source_type = pa.list_(pa.string())
+    rows = _SchemaSampleRows(
+        [
+            {
+                "text_unit_key": ("identity", "name", 0),
+                "source_values": None,
+                "sentence_index": 0,
+                "text": "First.",
+                "full_text": None,
+                "language": None,
+                "sentence_status": "success",
+                "polygon_ids": ["polygon-1"],
+            },
+            {
+                "text_unit_key": ("identity", "name", 1),
+                "source_values": ["later"],
+                "sentence_index": 1,
+                "text": "Second.",
+                "full_text": "First. Second.",
+                "language": "eng",
+                "sentence_status": "success",
+                "polygon_ids": ["polygon-1"],
+            },
+        ]
+    )
+    rows.output_schema = pa.schema(
+        [
+            pa.field("source_values", source_type),
+            pa.field("sentence_index", pa.int64()),
+            pa.field("text", pa.string()),
+            pa.field("full_text", pa.string()),
+            pa.field("language", pa.string()),
+            pa.field("sentence_status", pa.string()),
+            pa.field("polygon_ids", pa.list_(pa.string())),
+        ]
+    )
+
+    schema = _table_schema(
+        "text_units", rows, pa.schema([("source_values", source_type)])
+    )
+
+    assert rows.accessed == []
+    assert schema.names == [
+        "source_values",
+        "sentence_index",
+        "text",
+        "full_text",
+        "language",
+        "sentence_status",
+        "polygon_ids",
+    ]
+    assert schema.field("source_values").type == source_type
+    assert schema.field("sentence_index").type == pa.int64()
+    assert schema.field("text").type == pa.string()
+    assert schema.field("full_text").type == pa.string()
+    assert schema.field("language").type == pa.string()
+    assert schema.field("sentence_status").type == pa.string()
+    assert schema.field("polygon_ids").type == pa.list_(pa.string())
+
+
+class _SchemaSampleRows:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self._rows = rows
+        self.accessed: list[int] = []
+        self.output_schema: pa.Schema | None = None
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        self.accessed.append(index)
+        return self._rows[index]
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        for index in range(len(self)):
+            yield self[index]
