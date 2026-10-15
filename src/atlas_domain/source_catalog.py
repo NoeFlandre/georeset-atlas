@@ -118,6 +118,31 @@ def _safe_parquet_path(path: object) -> str:
     return path
 
 
+def companion_input_paths(
+    source: SourceDataset,
+    labels_root: str,
+    labels_path: str,
+) -> dict[str, str]:
+    safe_path = _safe_parquet_path(labels_path)
+    if labels_root not in source.table_roots.get("labels", ()):
+        raise ValueError("labels_root must be declared by the source catalog")
+    project = labels_root.removeprefix("labels/").split("/")[0]
+    basename = safe_path.rsplit("/", 1)[-1]
+    paths: dict[str, str] = {}
+    for table, roots in source.table_roots.items():
+        if table == "labels":
+            continue
+        candidates = (
+            tuple(root for root in roots if root.split("/")[0] == project)
+            if len(roots) > 1
+            else roots
+        )
+        if len(candidates) != 1:
+            raise ValueError(f"no unique {table!r} root for project {project!r}")
+        paths[table] = f"{candidates[0]}/{basename}"
+    return paths
+
+
 def select_input_file(
     catalog: Iterable[SourceDataset],
     *,

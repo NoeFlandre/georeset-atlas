@@ -40,4 +40,6 @@ jobs:
       - name: Run tests
         run: uv run --locked --no-sync pytest -q
       - name: Smoke-test CLI help
-        run: PYTHONPATH=src uv run --locked --no-sync python -m atlas_io.shard_cli --help
+        run: |
+          PYTHONPATH=src uv run --locked --no-sync python -m atlas_io.shard_cli --help
+          PYTHONPATH=src uv run --locked --no-sync python -m atlas_io.assembly_cli --help

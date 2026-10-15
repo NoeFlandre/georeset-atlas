@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import tempfile
 from bisect import bisect_right
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -187,6 +188,7 @@ def write_joined_partition(
     output_dir: Path,
     build: Callable[[], JoinedPartition],
     schema_provider: SchemaProvider | None = None,
+    resume_orphans: bool = False,
 ) -> JoinedPartitionResult:
     source_dataset, table_root = select_input_file(
         SOURCE_CATALOG, source_id=source_id, table="labels", path=path
@@ -205,7 +207,8 @@ def write_joined_partition(
     manifest_path = output_dir / f"{prefix}.manifest.json"
     if manifest_path.exists():
         return _verify(output_dir, manifest_path, prefix, identity)
-    _reject_orphans(output_dir, prefix, allowed=())
+    if not resume_orphans:
+        _reject_orphans(output_dir, prefix, allowed=())
     partition = build()
     if not isinstance(partition, JoinedPartition):
         raise TypeError("build must return a JoinedPartition")
@@ -224,9 +227,15 @@ def write_joined_partition(
             getattr(partition, table),
             source_schemas.get(table),
             shared=_is_shared(source_id, table),
+            resume_orphans=resume_orphans,
         )
         for table in publication_order
     }
+    _reject_orphans(
+        output_dir,
+        prefix,
+        allowed={manifest_path.name, *(output["name"] for output in outputs.values())},
+    )
     manifest: dict[str, Any] = {
         **identity,
         "label_row_count": len(partition.labels),
@@ -376,16 +385,32 @@ def _publish_table(
     source: pa.Schema | None,
     *,
     shared: bool,
+    resume_orphans: bool,
 ) -> dict[str, Any]:
     name = f"{prefix}.{table}.parquet"
+    final_path = output_dir / name
     row_count = len(rows)
     schema = _table_schema(table, rows, source)
     columns = schema.names
-    digest, size = _write_atomically(
-        output_dir / name,
-        lambda handle: _write_batches(handle, schema, _record_batches(rows, schema)),
-        verify=lambda temporary: _verify_table(temporary, columns, row_count),
-    )
+
+    def write(handle: BinaryIO) -> None:
+        _write_batches(handle, schema, _record_batches(rows, schema))
+
+    def verify(temporary: Path) -> None:
+        _verify_table(temporary, columns, row_count)
+
+    if resume_orphans and final_path.exists():
+        with tempfile.TemporaryDirectory(
+            prefix=".atlas-candidate-", dir=output_dir
+        ) as directory:
+            candidate = Path(directory) / name
+            digest, size = _write_atomically(candidate, write, verify=verify)
+            existing_digest, existing_size = _stream_sha256(final_path)
+            if (existing_digest, existing_size) != (digest, size):
+                raise _conflict(f"orphan output {name} differs from rebuilt content")
+            verify(final_path)
+    else:
+        digest, size = _write_atomically(final_path, write, verify=verify)
     output = {
         "name": name,
         "size_bytes": size,
@@ -519,6 +544,10 @@ def _reject_orphans(output_dir: Path, prefix: str, *, allowed: Collection[str]) 
 
 def _owned(name: str, prefix: str) -> bool:
     return name.startswith((f"{prefix}.", f".{prefix}."))
+
+
+def joined_manifest_path(output_dir: Path, source_id: str, path: str) -> Path:
+    return output_dir / f"{_output_prefix(source_id, path)}.manifest.json"
 
 
 def _output_prefix(source_id: str, path: str) -> str:

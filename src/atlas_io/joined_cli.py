@@ -5,7 +5,7 @@ import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import pyarrow as pa
 
@@ -16,6 +16,7 @@ from atlas_domain.joined_outputs import (
 from atlas_domain.source_catalog import (
     SOURCE_CATALOG,
     SourceDataset,
+    companion_input_paths,
     select_input_file,
 )
 from atlas_domain.source_records import DataJoinError
@@ -80,29 +81,6 @@ _OUTPUTS_BY_INPUT: Mapping[str, Mapping[str, tuple[str, ...]]] = {
         "polygons": ("polygon_records",),
     },
 }
-
-
-def _companion_root(table: str, roots: Sequence[str], project: str) -> str:
-    if len(roots) == 1:
-        return roots[0]
-    matching = [root for root in roots if root.split("/")[0] == project]
-    if len(matching) != 1:
-        raise ValueError(f"no unique {table!r} root for project {project!r}")
-    return matching[0]
-
-
-def _companion_paths(
-    source: SourceDataset,
-    labels_root: str,
-    labels_path: str,
-) -> dict[str, str]:
-    basename = PurePosixPath(labels_path).name
-    project = labels_root.removeprefix("labels/").split("/")[0]
-    return {
-        table: f"{_companion_root(table, roots, project)}/{basename}"
-        for table, roots in source.table_roots.items()
-        if table != "labels"
-    }
 
 
 def _stage_rows(
@@ -205,6 +183,11 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="directory for the joined partition outputs and manifest",
     )
+    parser.add_argument(
+        "--resume-orphans",
+        action="store_true",
+        help=("reuse matching orphan outputs after an interrupted write"),
+    )
     return parser
 
 
@@ -223,7 +206,7 @@ def main(argv: Sequence[str] | None = None, *, opener: HubOpener | None = None) 
         )
         if source.source_id not in _SUPPORTED_SOURCE_IDS:
             raise ValueError(f"no joined partition is defined for {args.source!r}")
-        companions = _companion_paths(source, labels_root, args.labels)
+        companions = companion_input_paths(source, labels_root, args.labels)
     except ValueError as error:
         parser.error(str(error))
     inputs = {"labels": args.labels, **companions}
@@ -300,6 +283,7 @@ def main(argv: Sequence[str] | None = None, *, opener: HubOpener | None = None) 
                 output_dir=args.output_dir,
                 build=build,
                 schema_provider=source_schemas,
+                resume_orphans=args.resume_orphans,
             )
         except JoinedPartitionConflictError as error:
             return _report_error(EXIT_CONFLICT, error)

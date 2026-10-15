@@ -85,3 +85,14 @@ The audit records these field names: `sentence_index`, `split_status`, `original
 5. Wiki output manifests reference content-addressed `polygon_document_links` shards. Identical Parquet bytes share one physical shard across Wikipedia and Wikivoyage; distinct contents use distinct shards. Regression tests cover this writer behavior, but global link-shard reconciliation has not run.
 6. Wiki viewer language codes do not match the Wiki language-split directories. See [Methods](methods.md).
 7. Pilot joins cover Afghanistan only. They are not full-source results.
+
+## Bounded assembly command
+
+The global builder first inventories the frozen Hub tree metadata and checks that the output volume has the planned reserve. It then reads one labels partition at a time with strict HTTP Range requests and writes a hash-verified partition manifest. A rerun verifies committed partitions and resumes at the first unfinished partition. After an interrupted write, it reuses an orphan output only when rebuilding the same frozen partition produces the same hash.
+
+```sh
+atlas-assemble --output-dir /path/on/a/large/local/volume/atlas-v0 --dry-run
+atlas-assemble --output-dir /path/on/a/large/local/volume/atlas-v0 --max-bytes 2500000000
+```
+
+The dry run makes metadata requests only; it does not read Parquet rows or create the output directory. The builder stops before starting another partition if the live free-space reserve is no longer met. It writes `assembly-plan.json`, `assembly-progress.json`, and, after exact source status reconciliation, `assembly-manifest.json`.

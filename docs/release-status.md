@@ -9,7 +9,7 @@ A gate is a required input or check. A pending gate is not complete. Every gate 
 | Area | State |
 | --- | --- |
 | Source pins | Frozen in the source catalog |
-| Test suite | The current work in progress passed 397 tests with 16 pytest-bdd deprecation warnings. This is not the final gauntlet. |
+| Test suite | The current work in progress passed 436 tests with 16 pytest-bdd deprecation warnings. This is not the final gauntlet. |
 | Pilot joins | Done for Afghanistan only |
 | Full assembly | Not recorded as done |
 | Language crosswalk asset | Generated as `atlas-language-crosswalk-1.0.0`. Row-level provenance, output integration, and inventory reconciliation are pending. |

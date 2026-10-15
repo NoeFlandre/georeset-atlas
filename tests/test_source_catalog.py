@@ -10,6 +10,7 @@ from atlas_domain.source_catalog import (
     SOURCE_CATALOG,
     SourceDataset,
     SourceStatus,
+    companion_input_paths,
     validate_catalog,
 )
 
@@ -82,6 +83,22 @@ def test_catalog_has_the_three_frozen_input_revisions() -> None:
             "NoeFlandre/osm-polygon-wikidata-and-wikipedia-landuse",
             "49307aeb05b6dcc8a5d393f77f59a1e6d13a967a",
         ),
+    }
+
+
+def test_companion_paths_follow_the_label_project_and_basename() -> None:
+    wiki = next(source for source in SOURCE_CATALOG if source.source_id == "wiki")
+    paths = companion_input_paths(
+        wiki,
+        "labels/wikivoyage/sentences",
+        "labels/wikivoyage/sentences/afghanistan-latest.parquet",
+    )
+
+    assert paths == {
+        "polygons": "polygons/afghanistan-latest.parquet",
+        "text_units": "wikivoyage/sentences/afghanistan-latest.parquet",
+        "documents": "wikivoyage/documents/afghanistan-latest.parquet",
+        "polygon_document_links": "polygon_document_links/afghanistan-latest.parquet",
     }
 
 

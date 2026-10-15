@@ -170,6 +170,30 @@ def test_first_run_writes_every_table_and_a_complete_manifest(tmp_path: Path) ->
         assert output["row_count"] == pq.ParquetFile(file).metadata.num_rows
 
 
+def test_resume_orphans_reuses_only_identical_partition_outputs(tmp_path: Path) -> None:
+    output_dir = tmp_path / "joined"
+    first = _write(output_dir, CountingBuild())
+    expected = _outputs(output_dir)
+    first.manifest_path.unlink()
+    build = CountingBuild()
+
+    result = write_joined_partition(
+        source_id=SOURCE_ID,
+        repo_id=REPO_ID,
+        revision=REVISION,
+        path=PATH,
+        output_dir=output_dir,
+        build=build,
+        resume_orphans=True,
+    )
+
+    assert result.status == "written"
+    assert build.calls == 1
+    assert _outputs(output_dir) == expected | {
+        result.manifest_path.name: result.manifest_path.read_bytes()
+    }
+
+
 def test_identical_rerun_verifies_the_manifest_and_skips_new_reads(
     tmp_path: Path,
 ) -> None:
