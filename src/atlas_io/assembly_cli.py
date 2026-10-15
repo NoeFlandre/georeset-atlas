@@ -41,6 +41,7 @@ EXIT_CONFLICT = 3
 EXIT_BUDGET = 4
 EXIT_PARTITION = 5
 EXIT_RECONCILIATION = 6
+EXIT_PAUSED = 7
 _PLAN_FILE = "assembly-plan.json"
 _PROGRESS_FILE = "assembly-progress.json"
 _MANIFEST_FILE = "assembly-manifest.json"
@@ -75,11 +76,21 @@ def _parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "The assembly resumes by verifying completed partition manifests. "
-            "Inputs are read with strict Range requests and are never modified."
+            "Inputs are read with strict Range requests and are never modified. "
+            "An unfinished partition is retried when the assembly resumes."
         ),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--max-bytes", type=_positive_int, default=DEFAULT_MAX_BYTES)
+    parser.add_argument(
+        "--max-new-partitions",
+        type=_positive_int,
+        help=(
+            "pause after this many partitions without an existing manifest have "
+            "completed; previously completed partitions are verified and do not "
+            "count toward the limit"
+        ),
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -330,6 +341,7 @@ def _progress_payload(
     sources: dict[str, dict[str, Any]],
     output_bytes: int,
     error: str | None = None,
+    pending_partition: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "assembly_version": ASSEMBLY_VERSION,
@@ -342,6 +354,8 @@ def _progress_payload(
     }
     if error is not None:
         payload["error"] = error
+    if pending_partition is not None:
+        payload["pending_partition"] = pending_partition
     return payload
 
 
@@ -476,6 +490,7 @@ def main(
         "polygon_document_links": 0,
     }
     completed = 0
+    new_partitions_completed = 0
     print(
         "ASSEMBLY_START "
         + json.dumps(
@@ -520,6 +535,10 @@ def main(
                 file=sys.stderr,
             )
             return EXIT_BUDGET
+        manifest_path = joined_manifest_path(
+            args.output_dir, source.source_id, partition.labels_path
+        )
+        had_manifest = manifest_path.exists()
         (
             heartbeat_stop,
             heartbeat_thread,
@@ -544,6 +563,32 @@ def main(
                     opener=join_opener,
                     progress_callback=update_stage,
                 )
+        except KeyboardInterrupt:
+            heartbeat_stop.set()
+            heartbeat_thread.join()
+            heartbeat_write("paused", "join")
+            payload = _progress_payload(
+                plan_sha256=plan_doc["plan_sha256"],
+                status="paused",
+                partitions_completed=completed,
+                partitions_total=plan.partition_count,
+                sources=source_progress,
+                output_bytes=output_bytes,
+                error=(
+                    "graceful interrupt during partition; unfinished partition will "
+                    "be retried when the assembly resumes"
+                ),
+                pending_partition=partition.labels_path,
+            )
+            _write_json_atomic(
+                args.output_dir / _PROGRESS_FILE, _canonical_json(payload)
+            )
+            print(
+                "atlas-assemble: paused after graceful interrupt; resume to retry "
+                f"{partition.labels_path}",
+                file=sys.stderr,
+            )
+            return EXIT_PAUSED
         except BaseException as error:
             heartbeat_stop.set()
             heartbeat_thread.join()
@@ -599,6 +644,8 @@ def main(
                 output_rows[table] += output["row_count"]
 
         completed += 1
+        if not had_manifest:
+            new_partitions_completed += 1
         try:
             free, required = _check_budget(
                 args.output_dir,
@@ -632,6 +679,40 @@ def main(
             output_bytes=output_bytes,
         )
         _write_json_atomic(args.output_dir / _PROGRESS_FILE, _canonical_json(progress))
+        if (
+            args.max_new_partitions is not None
+            and new_partitions_completed >= args.max_new_partitions
+            and completed < plan.partition_count
+        ):
+            next_partition = plan.partitions[completed]
+            paused = _progress_payload(
+                plan_sha256=plan_doc["plan_sha256"],
+                status="paused",
+                partitions_completed=completed,
+                partitions_total=plan.partition_count,
+                sources=source_progress,
+                output_bytes=output_bytes,
+                error="paused at the requested new-partition limit",
+                pending_partition=next_partition.labels_path,
+            )
+            heartbeat_write("paused", "checkpoint")
+            _write_json_atomic(
+                args.output_dir / _PROGRESS_FILE, _canonical_json(paused)
+            )
+            print(
+                "ASSEMBLY_PAUSED "
+                + json.dumps(
+                    {
+                        "partitions_completed": completed,
+                        "partitions_total": plan.partition_count,
+                        "new_partitions_completed": new_partitions_completed,
+                        "pending_partition": next_partition.labels_path,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            return EXIT_PAUSED
         print(
             "ASSEMBLY_PROGRESS "
             + json.dumps(
