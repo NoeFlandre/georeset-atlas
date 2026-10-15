@@ -26,6 +26,7 @@ MANIFEST_VERSION = 1
 PARQUET_COMPRESSION = "zstd"
 OUTPUT_BATCH_ROWS = 10_000
 OUTPUT_BATCH_BYTES = 1024 * 1024
+READ_BATCH_ROWS = 512
 OUTPUT_TABLES = (
     "labels",
     "text_units",
@@ -144,8 +145,16 @@ class StagedRows:
         results: list[Row] = [{} for _ in normalized]
         for group, group_requests in sorted(requests.items()):
             table = parquet_file.read_row_group(group)
-            for result_index, offset in group_requests:
-                results[result_index] = table.slice(offset, 1).to_pylist()[0]
+            for start in range(0, len(group_requests), READ_BATCH_ROWS):
+                batch_requests = group_requests[start : start + READ_BATCH_ROWS]
+                offsets = pa.array(
+                    [offset for _, offset in batch_requests], type=pa.int64()
+                )
+                selected_rows = table.take(offsets).to_pylist()
+                for (result_index, _), row in zip(
+                    batch_requests, selected_rows, strict=True
+                ):
+                    results[result_index] = row
             del table
         return results
 

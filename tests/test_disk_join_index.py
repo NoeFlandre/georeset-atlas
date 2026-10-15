@@ -31,6 +31,32 @@ def test_join_index_persists_ordered_occurrences_and_typed_keys(
     reopened.close()
 
 
+def test_occurrence_read_does_not_commit_pending_rows(tmp_path: Path) -> None:
+    path = tmp_path / "pending.sqlite"
+    index = DiskJoinIndex(path)
+    index.add("pending", 1)
+
+    assert list(index.iter_row_indices("pending")) == [1]
+    index.close()
+
+    reopened = DiskJoinIndex(path)
+    assert list(reopened.iter_row_indices("pending")) == []
+    reopened.close()
+
+
+def test_occurrence_index_tracks_additions_after_a_read(tmp_path: Path) -> None:
+    index = DiskJoinIndex(tmp_path / "append.sqlite")
+    index.add("shared", 3)
+
+    assert list(index.iter_row_indices("shared")) == [3]
+
+    index.add("shared", 8)
+    index.commit()
+
+    assert list(index.iter_row_indices("shared")) == [3, 8]
+    index.close()
+
+
 def test_nested_composite_keys_persist_without_type_or_boundary_collisions(
     tmp_path: Path,
 ) -> None:

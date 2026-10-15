@@ -67,15 +67,22 @@ class DiskJoinIndex(_SQLiteFile):
             "(sequence INTEGER PRIMARY KEY, key BLOB NOT NULL, "
             "row_ordinal INTEGER NOT NULL CHECK(row_ordinal >= 0))"
         )
-        self._connection.execute(
-            "CREATE INDEX IF NOT EXISTS row_occurrences_key_sequence "
-            "ON row_occurrences(key, sequence)"
-        )
+        self._occurrence_index_ready = False
         self._connection.execute(
             "CREATE TABLE IF NOT EXISTS unique_rows "
             "(key BLOB PRIMARY KEY, row_ordinal INTEGER NOT NULL "
             "CHECK(row_ordinal >= 0))"
         )
+
+    def commit(self) -> None:
+        self._ensure_open()
+        if not self._occurrence_index_ready:
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS row_occurrences_key_sequence "
+                "ON row_occurrences(key, sequence)"
+            )
+            self._occurrence_index_ready = True
+        self._connection.commit()
 
     def add(self, key: JoinKey, row_ordinal: int) -> None:
         self._ensure_open()
@@ -86,9 +93,10 @@ class DiskJoinIndex(_SQLiteFile):
 
     def iter_row_indices(self, key: JoinKey) -> Iterator[int]:
         self._ensure_open()
+        encoded = _canonical_key(key)
         cursor = self._connection.execute(
             "SELECT row_ordinal FROM row_occurrences WHERE key = ? ORDER BY sequence",
-            (_canonical_key(key),),
+            (encoded,),
         )
         return (int(row[0]) for row in cursor)
 

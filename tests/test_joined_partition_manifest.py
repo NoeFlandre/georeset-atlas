@@ -866,6 +866,45 @@ def test_staged_rows_read_many_groups_row_groups_once_and_preserves_request_orde
     assert staged.read_many([]) == []
 
 
+def test_staged_rows_read_many_preserves_order_across_read_batches(
+    tmp_path: Path,
+) -> None:
+    row_count = 1_205
+    metadata = pa.array(
+        [
+            None
+            if position % 19 == 0
+            else {"code": f"c{position}", "revisions": [position, position + 1]}
+            for position in range(row_count)
+        ],
+        type=pa.struct(
+            [
+                pa.field("code", pa.string()),
+                pa.field("revisions", pa.list_(pa.int64())),
+            ]
+        ),
+    )
+    staged = stage_table_groups(
+        [
+            pa.table(
+                {
+                    "position": list(range(row_count)),
+                    "metadata": metadata,
+                    "updated_at": pa.array(
+                        [datetime(2025, 1, 1)] * row_count, type=pa.timestamp("us")
+                    ),
+                }
+            )
+        ],
+        tmp_path / "large-polygons.parquet",
+    )
+    indices = [*range(row_count - 1, -1, -1), 0, 511, 512, row_count - 1]
+
+    rows = staged.read_many(indices)
+
+    assert rows == [staged[index] for index in indices]
+
+
 @pytest.mark.parametrize(
     ("indices", "error"),
     [([6], IndexError), ([-7], IndexError), ([1.5], TypeError)],
