@@ -1,6 +1,6 @@
 import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,7 @@ from atlas_domain.source_records import DataJoinError
 from atlas_io.joined_partitions import (
     JoinedPartitionConflictError,
     JoinedPartitionResult,
+    stage_table_groups,
     write_joined_partition,
 )
 
@@ -110,6 +111,7 @@ def _write(
     *,
     revision: str = REVISION,
     path: str = PATH,
+    schema_provider: Callable[[], dict[str, pa.Schema]] | None = None,
 ) -> JoinedPartitionResult:
     return write_joined_partition(
         source_id=SOURCE_ID,
@@ -118,6 +120,7 @@ def _write(
         path=path,
         output_dir=output_dir,
         build=build,
+        schema_provider=schema_provider,
     )
 
 
@@ -181,6 +184,76 @@ def test_identical_rerun_verifies_the_manifest_and_skips_new_reads(
     assert second.manifest == first.manifest
     assert build.calls == 1
     assert _outputs(output_dir) == written
+
+
+class CountingSchemas:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self) -> dict[str, pa.Schema]:
+        self.calls += 1
+        return {}
+
+
+def test_schema_provider_runs_after_build_on_a_new_write(tmp_path: Path) -> None:
+    events: list[str] = []
+
+    def build() -> JoinedPartition:
+        events.append("build")
+        return _partition()
+
+    def schemas() -> dict[str, pa.Schema]:
+        events.append("schemas")
+        return {}
+
+    _write(tmp_path / "joined", build, schema_provider=schemas)
+
+    assert events == ["build", "schemas"]
+
+
+def test_identical_rerun_does_not_call_the_schema_provider(tmp_path: Path) -> None:
+    output_dir = tmp_path / "joined"
+    build = CountingBuild()
+    schemas = CountingSchemas()
+    first = _write(output_dir, build, schema_provider=schemas)
+    written = _outputs(output_dir)
+
+    second = _write(output_dir, build, schema_provider=schemas)
+
+    assert first.status == "written"
+    assert second.status == "verified"
+    assert schemas.calls == 1
+    assert build.calls == 1
+    assert _outputs(output_dir) == written
+
+
+def test_null_only_list_elements_keep_the_exact_source_list_type(
+    tmp_path: Path,
+) -> None:
+    list_type = pa.list_(
+        pa.struct(
+            [
+                pa.field("key", pa.string(), nullable=False),
+                pa.field("value", pa.string()),
+            ]
+        )
+    )
+    polygon_rows = [{**POLYGONS[0], "localized_descriptions": [None, None]}]
+    result = _write(
+        tmp_path / "joined",
+        lambda: join_description_partition(
+            label_rows=LABELS, text_unit_rows=TEXTS, polygon_rows=polygon_rows
+        ),
+        schema_provider=lambda: {
+            "polygon_records": pa.schema([("localized_descriptions", list_type)])
+        },
+    )
+    outputs = result.manifest["outputs"]
+    polygon_records = result.manifest_path.parent / outputs["polygon_records"]["name"]
+    schema = pq.ParquetFile(polygon_records).schema_arrow
+    assert schema.field("localized_descriptions").type == list_type
+    column = pq.read_table(polygon_records).column("localized_descriptions")
+    assert column.to_pylist() == [[None, None]]
 
 
 @pytest.mark.parametrize(
@@ -340,16 +413,16 @@ def test_interrupted_publish_leaves_an_orphan_that_is_preserved(
 ) -> None:
     output_dir = tmp_path / "joined"
     build = CountingBuild()
-    original_write_table = pq.write_table
-    writes: list[str] = []
+    original_write_batch = pq.ParquetWriter.write_batch
+    writes: list[pa.RecordBatch] = []
 
-    def fail_on_second_table(table: pa.Table, handle: Any, **options: Any) -> None:
-        writes.append("table")
+    def fail_on_second_batch(writer: pq.ParquetWriter, batch: pa.RecordBatch) -> None:
+        writes.append(batch)
         if len(writes) == 2:
             raise OSError("disk full")
-        original_write_table(table, handle, **options)
+        original_write_batch(writer, batch)
 
-    monkeypatch.setattr(pq, "write_table", fail_on_second_table)
+    monkeypatch.setattr(pq.ParquetWriter, "write_batch", fail_on_second_batch)
 
     with pytest.raises(OSError, match="disk full"):
         _write(output_dir, build)
@@ -521,3 +594,107 @@ def test_native_geometry_strings_are_persisted_unchanged(tmp_path: Path) -> None
         '{"type":"Point","coordinates":[69.1,34.4]}',
         '{"type":"Point","coordinates":[69.2,34.5]}',
     ]
+
+
+class ScanCounter:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.scanned = 0
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        for row in self.rows:
+            self.scanned += 1
+            yield row
+
+
+def _polygon_row(polygon_id: str, description_identity: str) -> dict[str, Any]:
+    return {
+        "polygon_id": polygon_id,
+        "description_identity": description_identity,
+        "geometry_wkb": polygon_id.encode(),
+    }
+
+
+def test_polygon_records_index_follows_selected_rows_in_source_order() -> None:
+    partition = join_description_partition(
+        label_rows=LABELS,
+        text_unit_rows=TEXTS,
+        polygon_rows=[
+            _polygon_row("polygon-a", "description-1"),
+            _polygon_row("polygon-b", "description-2"),
+            _polygon_row("polygon-c", "description-1"),
+        ],
+    )
+    records = partition.polygon_records
+
+    assert len(records) == 2
+    assert records[0]["polygon_id"] == "polygon-a"
+    assert records[1]["polygon_id"] == "polygon-c"
+    assert records[-1]["polygon_id"] == "polygon-c"
+    assert records[-2]["polygon_id"] == "polygon-a"
+    with pytest.raises(IndexError):
+        records[2]
+    with pytest.raises(IndexError):
+        records[-3]
+
+
+def test_polygon_records_index_stops_scanning_at_the_requested_row() -> None:
+    source = ScanCounter(
+        [
+            _polygon_row("polygon-a", "description-1"),
+            _polygon_row("polygon-b", "description-1"),
+            _polygon_row("polygon-c", "description-1"),
+        ]
+    )
+    partition = join_description_partition(
+        label_rows=LABELS, text_unit_rows=TEXTS, polygon_rows=source
+    )
+    source.scanned = 0
+
+    assert partition.polygon_records[0]["polygon_id"] == "polygon-a"
+    assert source.scanned == 1
+    source.scanned = 0
+    assert partition.polygon_records[1]["polygon_id"] == "polygon-b"
+    assert source.scanned == 2
+
+
+def test_staged_polygon_index_reads_only_the_row_group_holding_the_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "polygons.parquet"
+    staged = stage_table_groups(
+        [
+            pa.table({"polygon_id": ["a", "b"], "geometry": [b"1", b"2"]}),
+            pa.table({"polygon_id": ["c"], "geometry": [b"3"]}),
+            pa.table({"polygon_id": ["d", "e", "f"], "geometry": [b"4", b"5", b"6"]}),
+        ],
+        path,
+    )
+    assert pq.ParquetFile(path).metadata.num_row_groups == 3
+    original_read_row_group = pq.ParquetFile.read_row_group
+    read_groups: list[int] = []
+
+    def record_read(
+        parquet_file: pq.ParquetFile, index: int, **options: Any
+    ) -> pa.Table:
+        read_groups.append(index)
+        return original_read_row_group(parquet_file, index, **options)
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", record_read)
+
+    assert staged[3]["polygon_id"] == "d"
+    assert staged[-1]["polygon_id"] == "f"
+    assert read_groups == [2, 2]
+    with pytest.raises(IndexError):
+        staged[6]
+    with pytest.raises(IndexError):
+        staged[-7]
+
+
+def test_staged_rows_expose_the_exact_schema_of_their_groups(tmp_path: Path) -> None:
+    list_type = pa.list_(pa.string())
+    group = pa.table({"localized_descriptions": pa.array([[None, None]], list_type)})
+    staged = stage_table_groups([group], tmp_path / "text_units.parquet")
+
+    assert staged.schema_arrow.field("localized_descriptions").type == list_type

@@ -1,8 +1,10 @@
 import json
+import operator
 from collections import Counter
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from itertools import islice
+from typing import Any, Protocol
 
 from atlas_domain.occurrences import (
     description_occurrence_key,
@@ -19,6 +21,16 @@ from atlas_domain.source_records import (
 )
 
 Row = dict[str, Any]
+
+
+class RowSource(Protocol):
+    def __len__(self) -> int: ...
+
+    def __getitem__(self, index: int, /) -> Row: ...
+
+    def __iter__(self) -> Iterator[Row]: ...
+
+
 STATUSES = ("yes", "no", "failed", "skipped")
 _STATUS_BY_DECISION = {
     "yes": "yes",
@@ -40,7 +52,7 @@ _TEXT_UNIT_RESERVED = frozenset(
 class JoinedPartition:
     labels: tuple[Row, ...]
     text_units: tuple[Row, ...]
-    polygon_records: tuple[Row, ...]
+    polygon_records: RowSource
     documents: tuple[Row, ...]
     status_counts: Mapping[str, int]
     raw_decision_counts: Mapping[str, int]
@@ -53,24 +65,32 @@ def normalize_label_decision(raw_decision: object) -> str:
     return _STATUS_BY_DECISION[raw_decision]
 
 
+def normalize_row_index(index: int, length: int) -> int:
+    position = operator.index(index)
+    if position < 0:
+        position += length
+    if not 0 <= position < length:
+        raise IndexError(f"row index {index} is out of range for {length} rows")
+    return position
+
+
 def join_description_partition(
     *,
     label_rows: Iterable[Mapping[str, Any]],
     text_unit_rows: Iterable[Mapping[str, Any]],
     polygon_rows: Iterable[Mapping[str, Any]],
 ) -> JoinedPartition:
-    polygons_by_id: dict[str, Mapping[str, Any]] = {}
+    if iter(polygon_rows) is polygon_rows:
+        polygon_rows = tuple(polygon_rows)
+    seen_polygon_ids: set[str] = set()
     polygon_ids_by_association: dict[tuple[object, ...], list[str]] = {}
     for polygon in polygon_rows:
         association = _description_association(polygon, "polygon")
-        polygon_id = (
-            _identifier(polygon, "polygon_id", "polygon")
-            if "polygon_id" in polygon
-            else _description_polygon_id(association)
-        )
+        polygon_id = _description_polygon_identifier(polygon)
         _geometry(polygon, "polygon")
-        polygon_record = {**polygon, "polygon_id": polygon_id}
-        _add_unique(polygons_by_id, polygon_id, polygon_record, "polygon_id")
+        if polygon_id in seen_polygon_ids:
+            raise DataJoinError(f"duplicate polygon_id {polygon_id!r}")
+        seen_polygon_ids.add(polygon_id)
         polygon_ids_by_association.setdefault(association, []).append(polygon_id)
     texts_by_identity: dict[tuple[str, str], Mapping[str, Any]] = {}
     for text in text_unit_rows:
@@ -111,11 +131,9 @@ def join_description_partition(
     return _partition(
         labels,
         units.values(),
-        [
-            dict(polygon)
-            for polygon_id, polygon in polygons_by_id.items()
-            if polygon_id in referenced
-        ],
+        _SelectedRows(
+            polygon_rows, key=_description_polygon_identifier, selected=referenced
+        ),
         (),
     )
 
@@ -178,7 +196,7 @@ def join_website_partition(
     return _partition(
         labels,
         units.values(),
-        polygon_records,
+        tuple(polygon_records),
         (),
     )
 
@@ -281,11 +299,11 @@ def join_wiki_partition(
     return _partition(
         labels,
         units.values(),
-        [
+        tuple(
             dict(polygon)
             for polygon_id, polygon in polygons_by_id.items()
             if polygon_id in referenced_polygons
-        ],
+        ),
         [
             dict(document)
             for key, document in documents_by_key.items()
@@ -317,7 +335,7 @@ def _label_row(label: Mapping[str, Any], source_row_index: int, key: object) -> 
 def _partition(
     labels: Sequence[Row],
     text_units: Iterable[Row],
-    polygon_records: Sequence[Row],
+    polygon_records: RowSource,
     documents: Sequence[Row],
     polygon_document_links: Sequence[Row] = (),
 ) -> JoinedPartition:
@@ -326,7 +344,7 @@ def _partition(
     return JoinedPartition(
         labels=tuple(labels),
         text_units=tuple(text_units),
-        polygon_records=tuple(polygon_records),
+        polygon_records=polygon_records,
         documents=tuple(documents),
         polygon_document_links=tuple(polygon_document_links),
         status_counts={status: statuses[status] for status in STATUSES},
@@ -334,8 +352,40 @@ def _partition(
     )
 
 
+def _description_polygon_identifier(polygon: Mapping[str, Any]) -> str:
+    if "polygon_id" in polygon:
+        return _identifier(polygon, "polygon_id", "polygon")
+    return _description_polygon_id(_description_association(polygon, "polygon"))
+
+
 def _description_polygon_id(association: tuple[object, ...]) -> str:
     return json.dumps(association, ensure_ascii=True, separators=(",", ":"))
+
+
+class _SelectedRows:
+    def __init__(
+        self,
+        source: Iterable[Mapping[str, Any]],
+        *,
+        key: Callable[[Mapping[str, Any]], str],
+        selected: Collection[str],
+    ) -> None:
+        self._source = source
+        self._key = key
+        self._selected = selected
+
+    def __len__(self) -> int:
+        return len(self._selected)
+
+    def __getitem__(self, index: int) -> Row:
+        position = normalize_row_index(index, len(self))
+        return next(islice(self, position, None))
+
+    def __iter__(self) -> Iterator[Row]:
+        for polygon in self._source:
+            polygon_id = self._key(polygon)
+            if polygon_id in self._selected:
+                yield {**polygon, "polygon_id": polygon_id}
 
 
 def _website_text_for_label(

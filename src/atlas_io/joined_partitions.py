@@ -1,19 +1,28 @@
 import json
 import re
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from atlas_domain.joined_outputs import RAW_DECISIONS, STATUSES, JoinedPartition
+from atlas_domain.joined_outputs import (
+    RAW_DECISIONS,
+    STATUSES,
+    JoinedPartition,
+    Row,
+    RowSource,
+    normalize_row_index,
+)
 from atlas_domain.source_catalog import SOURCE_CATALOG, select_input_file
 from atlas_io.shard_increment import _stream_sha256, _write_atomically
 
 MANIFEST_VERSION = 1
 PARQUET_COMPRESSION = "zstd"
+OUTPUT_BATCH_ROWS = 10_000
+OUTPUT_BATCH_BYTES = 1024 * 1024
 OUTPUT_TABLES = (
     "labels",
     "text_units",
@@ -38,6 +47,7 @@ _MANIFEST_KEYS = frozenset(
 )
 _OUTPUT_KEYS = frozenset({"name", "size_bytes", "sha256", "row_count"})
 _ROW_KEY_FIELD = "text_unit_key"
+_GEOMETRY_FIELDS = frozenset({"geometry", "geometry_wkb"})
 _NON_SLUG = re.compile(r"[^a-z0-9]+")
 _TABLE_TYPES: Mapping[str, Mapping[str, pa.DataType]] = {
     "labels": {
@@ -72,8 +82,59 @@ _TABLE_TYPES: Mapping[str, Mapping[str, pa.DataType]] = {
 }
 
 
+SchemaProvider = Callable[[], Mapping[str, pa.Schema]]
+
+
 class JoinedPartitionConflictError(RuntimeError):
     pass
+
+
+class StagedRows:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    @property
+    def schema_arrow(self) -> pa.Schema:
+        return pq.ParquetFile(self._path).schema_arrow
+
+    def __len__(self) -> int:
+        return pq.ParquetFile(self._path).metadata.num_rows
+
+    def __getitem__(self, index: int) -> Row:
+        parquet_file = pq.ParquetFile(self._path)
+        metadata = parquet_file.metadata
+        position = normalize_row_index(index, metadata.num_rows)
+        for group in range(metadata.num_row_groups):
+            group_rows = metadata.row_group(group).num_rows
+            if position < group_rows:
+                table = parquet_file.read_row_group(group)
+                return table.slice(position, 1).to_pylist()[0]
+            position -= group_rows
+        raise IndexError(
+            f"row index {index} is out of range for {metadata.num_rows} rows"
+        )
+
+    def __iter__(self) -> Iterator[Row]:
+        parquet_file = pq.ParquetFile(self._path)
+        for index in range(parquet_file.metadata.num_row_groups):
+            yield from parquet_file.read_row_group(index).to_pylist()
+
+
+def stage_table_groups(groups: Iterable[pa.Table], path: Path) -> StagedRows:
+    writer: pq.ParquetWriter | None = None
+    try:
+        for group in groups:
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    path, group.schema, compression=PARQUET_COMPRESSION
+                )
+            writer.write_table(group)
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        raise ValueError(f"{path.name} has no row groups to stage")
+    return StagedRows(path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +152,7 @@ def write_joined_partition(
     path: str,
     output_dir: Path,
     build: Callable[[], JoinedPartition],
+    schema_provider: SchemaProvider | None = None,
 ) -> JoinedPartitionResult:
     source_dataset, table_root = select_input_file(
         SOURCE_CATALOG, source_id=source_id, table="labels", path=path
@@ -113,9 +175,16 @@ def write_joined_partition(
     partition = build()
     if not isinstance(partition, JoinedPartition):
         raise TypeError("build must return a JoinedPartition")
+    source_schemas = _source_schemas(schema_provider)
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs = {
-        table: _publish_table(output_dir, prefix, table, getattr(partition, table))
+        table: _publish_table(
+            output_dir,
+            prefix,
+            table,
+            getattr(partition, table),
+            source_schemas.get(table),
+        )
         for table in OUTPUT_TABLES
     }
     manifest: dict[str, Any] = {
@@ -131,6 +200,20 @@ def write_joined_partition(
     payload = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
     _write_atomically(manifest_path, lambda handle: handle.write(payload))
     return JoinedPartitionResult("written", manifest, manifest_path)
+
+
+def _source_schemas(provider: SchemaProvider | None) -> Mapping[str, pa.Schema]:
+    if provider is None:
+        return {}
+    schemas = provider()
+    if not isinstance(schemas, Mapping):
+        raise TypeError("schema_provider must return a mapping of output tables")
+    unknown = sorted(set(schemas) - set(OUTPUT_TABLES))
+    if unknown:
+        raise ValueError(f"schema_provider names unknown output tables {unknown}")
+    if not all(isinstance(schema, pa.Schema) for schema in schemas.values()):
+        raise TypeError("schema_provider must map output tables to pyarrow schemas")
+    return schemas
 
 
 def _verify(
@@ -231,43 +314,99 @@ def _publish_table(
     output_dir: Path,
     prefix: str,
     table: str,
-    rows: Sequence[Mapping[str, Any]],
+    rows: RowSource,
+    source: pa.Schema | None,
 ) -> dict[str, Any]:
     name = f"{prefix}.{table}.parquet"
-    arrow_table = _arrow_table(rows, _TABLE_TYPES[table])
-    columns = arrow_table.column_names
+    row_count = len(rows)
+    schema = _table_schema(table, rows, source)
+    columns = schema.names
     digest, size = _write_atomically(
         output_dir / name,
-        lambda handle: pq.write_table(
-            arrow_table, handle, compression=PARQUET_COMPRESSION
-        ),
-        verify=lambda temporary: _verify_table(temporary, columns, len(rows)),
+        lambda handle: _write_batches(handle, schema, _record_batches(rows, schema)),
+        verify=lambda temporary: _verify_table(temporary, columns, row_count),
     )
-    return {"name": name, "size_bytes": size, "sha256": digest, "row_count": len(rows)}
+    return {"name": name, "size_bytes": size, "sha256": digest, "row_count": row_count}
 
 
-def _arrow_table(
-    rows: Sequence[Mapping[str, Any]],
-    declared: Mapping[str, pa.DataType],
-) -> pa.Table:
-    names: dict[str, None] = dict.fromkeys(declared) if not rows else {}
+def _table_schema(table: str, rows: RowSource, source: pa.Schema | None) -> pa.Schema:
+    declared = _TABLE_TYPES[table]
+    source_types: dict[str, pa.DataType] = (
+        {} if source is None else {field.name: field.type for field in source}
+    )
+    names: dict[str, None] = {} if len(rows) else dict.fromkeys(declared)
     for row in rows:
         for name in row:
             if name != _ROW_KEY_FIELD:
                 names.setdefault(name)
-    return pa.table(
-        {
-            name: pa.array(
-                [row.get(name) for row in rows],
-                type=(
-                    None
-                    if rows and name in {"geometry", "geometry_wkb"}
-                    else declared.get(name)
-                ),
-            )
+    return pa.schema(
+        [
+            pa.field(name, _column_type(name, declared, source_types, rows))
             for name in names
-        }
+        ]
     )
+
+
+def _column_type(
+    name: str,
+    declared: Mapping[str, pa.DataType],
+    source_types: Mapping[str, pa.DataType],
+    rows: RowSource,
+) -> pa.DataType:
+    if name in source_types:
+        return source_types[name]
+    if name in declared and name not in _GEOMETRY_FIELDS:
+        return declared[name]
+    for row in rows:
+        value = row.get(name)
+        if value is not None:
+            return pa.array([value]).type
+    return pa.null()
+
+
+def _record_batches(rows: RowSource, schema: pa.Schema) -> Iterator[pa.RecordBatch]:
+    pending: list[Mapping[str, Any]] = []
+    pending_bytes = 0
+    for row in rows:
+        pending.append(row)
+        pending_bytes += _row_bytes(row)
+        if len(pending) == OUTPUT_BATCH_ROWS or pending_bytes >= OUTPUT_BATCH_BYTES:
+            yield _record_batch(pending, schema)
+            pending = []
+            pending_bytes = 0
+    if pending:
+        yield _record_batch(pending, schema)
+
+
+def _record_batch(
+    rows: Sequence[Mapping[str, Any]],
+    schema: pa.Schema,
+) -> pa.RecordBatch:
+    arrays = [
+        pa.array([row.get(field.name) for row in rows], type=field.type)
+        for field in schema
+    ]
+    return pa.RecordBatch.from_arrays(arrays, schema=schema)
+
+
+def _row_bytes(row: Mapping[str, Any]) -> int:
+    total = 0
+    for value in row.values():
+        if isinstance(value, (bytes, str)):
+            total += len(value)
+        elif isinstance(value, (list, tuple)):
+            total += sum(len(item) for item in value if isinstance(item, (bytes, str)))
+    return total
+
+
+def _write_batches(
+    handle: BinaryIO,
+    schema: pa.Schema,
+    batches: Iterable[pa.RecordBatch],
+) -> None:
+    with pq.ParquetWriter(handle, schema, compression=PARQUET_COMPRESSION) as writer:
+        for batch in batches:
+            writer.write_batch(batch)
 
 
 def _verify_table(path: Path, columns: Sequence[str], rows: int) -> None:

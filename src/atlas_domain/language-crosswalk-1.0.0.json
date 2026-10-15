@@ -1,0 +1,24 @@
+{
+  "manifest": {
+    "mapping_version": "atlas-language-crosswalk-1.0.0",
+    "coverage": "explicit known mappings only; unknown inventory codes remain unresolved until proven",
+    "sources": [
+      "IANA Language Subtag Registry File-Date 2026-09-17, 731819 bytes, SHA-256 755fad43283be7b41ebe3c89ad054b6eaf928f404f9c0edb74799e0eab74beb1",
+      "RFC 5646",
+      "LOC ISO-639-2 UTF-8 list last-modified 2025-09-29, 16010 bytes, SHA-256 42b71885e4dc885559fda5ad059fd81838cf4782cedb5fd08cc3431f7d067371",
+      "Meta-Wiki Special language codes revision 29853230 (2025-12-28T01:36:49Z), SHA-1 8073d6c8557f9ddaab5e17340adcc999e3a4fb42"
+    ]
+  },
+  "entries": [
+    {"scheme": "lingua_iso639_3", "raw_code": "eng", "public_code": "en"},
+    {"scheme": "lingua_iso639_3", "raw_code": "cmn", "public_code": "cmn"},
+    {"scheme": "lingua_iso639_3", "raw_code": "pbt", "public_code": "pbt"},
+    {"scheme": "lingua_iso639_3", "raw_code": "nrm", "public_code": "nrm"},
+    {"scheme": "glotlid_iso639_3_script", "raw_code": "eng_Latn", "public_code": "en"},
+    {"scheme": "wikimedia_project_code", "raw_code": "als", "public_code": "gsw"},
+    {"scheme": "wikimedia_project_code", "raw_code": "zh-min-nan", "public_code": "nan"},
+    {"scheme": "wikimedia_project_code", "raw_code": "zh-yue", "public_code": "yue"},
+    {"scheme": "wikimedia_project_code", "raw_code": "zh-classical", "public_code": "lzh"},
+    {"scheme": "wikimedia_project_code", "raw_code": "simple", "public_code": "en"}
+  ]
+}

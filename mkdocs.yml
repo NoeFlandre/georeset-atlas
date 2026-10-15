@@ -1,0 +1,7 @@
+site_name: GeoReSeT Atlas
+site_description: Draft documentation for the GeoReSeT Atlas. The dataset is NOT RELEASE-READY.
+nav:
+  - Home: index.md
+  - Methods: methods.md
+  - Data schema: data-schema.md
+  - Release status: release-status.md
