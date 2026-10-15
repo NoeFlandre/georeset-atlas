@@ -1,14 +1,20 @@
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pytest_bdd import given, scenarios, then, when
 
 import atlas_io.assembly_cli as assembly_cli
 from atlas_domain.source_catalog import SourceDataset
 from atlas_io.hub_inventory import HubParquetFile
 from atlas_io.joined_partitions import joined_manifest_path
+
+scenarios("../features/assembly_resume.feature")
 
 
 def _source() -> SourceDataset:
@@ -33,15 +39,41 @@ def _files() -> tuple[HubParquetFile, ...]:
     )
 
 
-def _write_manifest(output_dir: Path, *, status_counts: dict[str, int]) -> None:
-    path = joined_manifest_path(output_dir, "fixture", "labels/data/a.parquet")
+def _two_partition_files() -> tuple[HubParquetFile, ...]:
+    return (
+        HubParquetFile("fixture", "labels", "labels/data/a.parquet", 100),
+        HubParquetFile("fixture", "labels", "labels/data/b.parquet", 100),
+        HubParquetFile("fixture", "text_units", "texts/a.parquet", 50),
+        HubParquetFile("fixture", "text_units", "texts/b.parquet", 50),
+        HubParquetFile("fixture", "polygons", "polygons/a.parquet", 30),
+        HubParquetFile("fixture", "polygons", "polygons/b.parquet", 30),
+    )
+
+
+def _partition_status_counts(labels_path: str) -> dict[str, int]:
+    return (
+        {"yes": 1, "no": 0, "failed": 1, "skipped": 0}
+        if labels_path.endswith("a.parquet")
+        else {"yes": 0, "no": 1, "failed": 0, "skipped": 1}
+    )
+
+
+def _write_partition_manifest(
+    output_dir: Path,
+    *,
+    labels_path: str,
+    status_counts: dict[str, int],
+) -> None:
+    path = joined_manifest_path(output_dir, "fixture", labels_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stem = Path(labels_path).stem
     path.write_text(
         json.dumps(
             {
                 "source_id": "fixture",
                 "repo_id": "owner/repo",
                 "revision": "0" * 40,
-                "path": "labels/data/a.parquet",
+                "path": labels_path,
                 "label_row_count": sum(status_counts.values()),
                 "status_counts": status_counts,
                 "row_counts": {
@@ -53,7 +85,7 @@ def _write_manifest(output_dir: Path, *, status_counts: dict[str, int]) -> None:
                 },
                 "outputs": {
                     table: {
-                        "name": f"a.{table}.parquet",
+                        "name": f"{stem}.{table}.parquet",
                         "size_bytes": 10,
                         "row_count": rows,
                     }
@@ -68,6 +100,94 @@ def _write_manifest(output_dir: Path, *, status_counts: dict[str, int]) -> None:
             }
         )
     )
+
+
+def _write_manifest(output_dir: Path, *, status_counts: dict[str, int]) -> None:
+    _write_partition_manifest(
+        output_dir,
+        labels_path="labels/data/a.parquet",
+        status_counts=status_counts,
+    )
+
+
+@given(
+    "a two-partition fixture with one row of each status",
+    target_fixture="assembly_resume",
+)
+def assembly_resume_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
+    source = _source()
+    monkeypatch.setattr(assembly_cli, "SOURCE_CATALOG", (source,))
+    monkeypatch.setattr(
+        assembly_cli,
+        "fetch_pinned_files",
+        lambda *_args, **_kwargs: _two_partition_files(),
+    )
+    state: dict[str, Any] = {
+        "calls": [],
+        "row_builds": [],
+        "output_dir": tmp_path / "assembly-resume-bdd",
+    }
+
+    def runner(argv: list[str], *, opener: Any = None) -> int:
+        labels_path = argv[argv.index("--labels") + 1]
+        output_dir = Path(argv[argv.index("--output-dir") + 1])
+        state["calls"].append(labels_path)
+        manifest_path = joined_manifest_path(output_dir, "fixture", labels_path)
+        if not manifest_path.exists():
+            state["row_builds"].append(labels_path)
+            _write_partition_manifest(
+                output_dir,
+                labels_path=labels_path,
+                status_counts=_partition_status_counts(labels_path),
+            )
+        return 0
+
+    monkeypatch.setattr(assembly_cli, "run_joined_partition", runner)
+    return state
+
+
+@when("the builder pauses after one new partition and then resumes")
+def pause_then_resume_assembly(assembly_resume: dict[str, Any]) -> None:
+    args = [
+        "--output-dir",
+        str(assembly_resume["output_dir"]),
+        "--max-new-partitions",
+        "1",
+    ]
+    assembly_resume["pause_exit"] = assembly_cli.main(args)
+    assembly_resume["paused_progress"] = json.loads(
+        (assembly_resume["output_dir"] / "assembly-progress.json").read_text()
+    )
+    assembly_resume["resume_exit"] = assembly_cli.main(args)
+    assembly_resume["complete_progress"] = json.loads(
+        (assembly_resume["output_dir"] / "assembly-progress.json").read_text()
+    )
+
+
+@then("the completed prefix is verified and totals are counted exactly once")
+def completed_prefix_is_reused_once(assembly_resume: dict[str, Any]) -> None:
+    assert assembly_resume["pause_exit"] == assembly_cli.EXIT_PAUSED
+    assert assembly_resume["paused_progress"]["pending_partition"] == (
+        "labels/data/b.parquet"
+    )
+    assert assembly_resume["resume_exit"] == assembly_cli.EXIT_OK
+    assert assembly_resume["complete_progress"]["partitions_completed"] == 2
+    assert assembly_resume["complete_progress"]["sources"]["fixture"]["label_rows"] == 4
+    assert assembly_resume["complete_progress"]["sources"]["fixture"][
+        "status_counts"
+    ] == {
+        "yes": 1,
+        "no": 1,
+        "failed": 1,
+        "skipped": 1,
+    }
+    assert assembly_resume["row_builds"] == [
+        "labels/data/a.parquet",
+        "labels/data/b.parquet",
+    ]
 
 
 def test_global_cli_checkpoints_each_partition_and_reconciles_expected_totals(
@@ -138,6 +258,212 @@ def test_global_cli_resumes_by_verifying_existing_partition_manifests(
     assert assembly_cli.main(["--output-dir", str(output_dir)]) == 0
     assert calls == 2
     assert (output_dir / "assembly-plan.json").read_bytes() == first_plan
+
+
+def test_cli_pauses_after_a_bounded_number_of_new_partitions_and_resumes_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source()
+    monkeypatch.setattr(assembly_cli, "SOURCE_CATALOG", (source,))
+    monkeypatch.setattr(
+        assembly_cli,
+        "fetch_pinned_files",
+        lambda *_args, **_kwargs: _two_partition_files(),
+    )
+    calls: list[str] = []
+    row_builds: list[str] = []
+
+    def runner(argv: list[str], *, opener: Any = None) -> int:
+        labels_path = argv[argv.index("--labels") + 1]
+        output_dir = Path(argv[argv.index("--output-dir") + 1])
+        calls.append(labels_path)
+        manifest_path = joined_manifest_path(output_dir, "fixture", labels_path)
+        if not manifest_path.exists():
+            row_builds.append(labels_path)
+            _write_partition_manifest(
+                output_dir,
+                labels_path=labels_path,
+                status_counts=_partition_status_counts(labels_path),
+            )
+        return 0
+
+    monkeypatch.setattr(assembly_cli, "run_joined_partition", runner)
+    output_dir = tmp_path / "assembly"
+    args = ["--output-dir", str(output_dir), "--max-new-partitions", "1"]
+
+    assert assembly_cli.main(args) == assembly_cli.EXIT_PAUSED
+
+    paused = json.loads((output_dir / "assembly-progress.json").read_text())
+    assert paused["status"] == "paused"
+    assert paused["partitions_completed"] == 1
+    assert paused["pending_partition"] == "labels/data/b.parquet"
+    assert not (output_dir / "assembly-manifest.json").exists()
+    assert calls == ["labels/data/a.parquet"]
+
+    assert assembly_cli.main(args) == assembly_cli.EXIT_OK
+
+    complete = json.loads((output_dir / "assembly-progress.json").read_text())
+    assert complete["status"] == "complete"
+    assert complete["partitions_completed"] == 2
+    assert complete["sources"]["fixture"]["label_rows"] == 4
+    assert complete["sources"]["fixture"]["status_counts"] == {
+        "yes": 1,
+        "no": 1,
+        "failed": 1,
+        "skipped": 1,
+    }
+    assert calls == [
+        "labels/data/a.parquet",
+        "labels/data/a.parquet",
+        "labels/data/b.parquet",
+    ]
+    assert row_builds == ["labels/data/a.parquet", "labels/data/b.parquet"]
+
+
+def test_graceful_interruption_checkpoints_and_retries_only_the_pending_partition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source()
+    monkeypatch.setattr(assembly_cli, "SOURCE_CATALOG", (source,))
+    monkeypatch.setattr(
+        assembly_cli,
+        "fetch_pinned_files",
+        lambda *_args, **_kwargs: _two_partition_files(),
+    )
+    calls: list[str] = []
+    row_builds: list[str] = []
+    interrupt = True
+
+    def runner(argv: list[str], *, opener: Any = None) -> int:
+        nonlocal interrupt
+        labels_path = argv[argv.index("--labels") + 1]
+        output_dir = Path(argv[argv.index("--output-dir") + 1])
+        calls.append(labels_path)
+        if labels_path.endswith("b.parquet") and interrupt:
+            interrupt = False
+            raise KeyboardInterrupt
+        manifest_path = joined_manifest_path(output_dir, "fixture", labels_path)
+        if not manifest_path.exists():
+            row_builds.append(labels_path)
+            _write_partition_manifest(
+                output_dir,
+                labels_path=labels_path,
+                status_counts=_partition_status_counts(labels_path),
+            )
+        return 0
+
+    monkeypatch.setattr(assembly_cli, "run_joined_partition", runner)
+    output_dir = tmp_path / "assembly"
+
+    assert (
+        assembly_cli.main(["--output-dir", str(output_dir)]) == assembly_cli.EXIT_PAUSED
+    )
+
+    paused = json.loads((output_dir / "assembly-progress.json").read_text())
+    assert paused["status"] == "paused"
+    assert paused["partitions_completed"] == 1
+    assert paused["pending_partition"] == "labels/data/b.parquet"
+    assert "graceful interrupt" in paused["error"]
+    assert not (output_dir / "assembly-manifest.json").exists()
+
+    assert assembly_cli.main(["--output-dir", str(output_dir)]) == assembly_cli.EXIT_OK
+
+    complete = json.loads((output_dir / "assembly-progress.json").read_text())
+    assert complete["partitions_completed"] == 2
+    assert complete["sources"]["fixture"]["label_rows"] == 4
+    assert complete["sources"]["fixture"]["status_counts"] == {
+        "yes": 1,
+        "no": 1,
+        "failed": 1,
+        "skipped": 1,
+    }
+    assert row_builds == ["labels/data/a.parquet", "labels/data/b.parquet"]
+    assert calls == [
+        "labels/data/a.parquet",
+        "labels/data/b.parquet",
+        "labels/data/a.parquet",
+        "labels/data/b.parquet",
+    ]
+
+
+def test_abrupt_child_exit_leaves_atomic_completed_prefix_that_resumes_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "assembly"
+    repository = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    source_path = str(repository / "src")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        part for part in (source_path, environment.get("PYTHONPATH", "")) if part
+    )
+    worker = repository / "tests" / "fixtures" / "assembly_crash_worker.py"
+
+    crashed = subprocess.run(
+        [sys.executable, str(worker), str(output_dir)],
+        cwd=repository,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    first_manifest = joined_manifest_path(
+        output_dir, "fixture", "labels/data/a.parquet"
+    )
+    second_manifest = joined_manifest_path(
+        output_dir, "fixture", "labels/data/b.parquet"
+    )
+    assert crashed.returncode == 73
+    assert first_manifest.is_file()
+    first_manifest_bytes = first_manifest.read_bytes()
+    assert not second_manifest.exists()
+    interrupted = json.loads((output_dir / "assembly-progress.json").read_text())
+    assert interrupted["status"] == "running"
+    assert interrupted["partitions_completed"] == 1
+
+    source = _source()
+    monkeypatch.setattr(assembly_cli, "SOURCE_CATALOG", (source,))
+    monkeypatch.setattr(
+        assembly_cli,
+        "fetch_pinned_files",
+        lambda *_args, **_kwargs: _two_partition_files(),
+    )
+    calls: list[str] = []
+    row_builds: list[str] = []
+
+    def runner(argv: list[str], *, opener: Any = None) -> int:
+        labels_path = argv[argv.index("--labels") + 1]
+        calls.append(labels_path)
+        manifest_path = joined_manifest_path(output_dir, "fixture", labels_path)
+        if not manifest_path.exists():
+            row_builds.append(labels_path)
+            _write_partition_manifest(
+                output_dir,
+                labels_path=labels_path,
+                status_counts=_partition_status_counts(labels_path),
+            )
+        return 0
+
+    monkeypatch.setattr(assembly_cli, "run_joined_partition", runner)
+
+    assert assembly_cli.main(["--output-dir", str(output_dir)]) == assembly_cli.EXIT_OK
+
+    complete = json.loads((output_dir / "assembly-progress.json").read_text())
+    assert complete["partitions_completed"] == 2
+    assert complete["sources"]["fixture"]["label_rows"] == 4
+    assert complete["sources"]["fixture"]["status_counts"] == {
+        "yes": 1,
+        "no": 1,
+        "failed": 1,
+        "skipped": 1,
+    }
+    assert first_manifest.read_bytes() == first_manifest_bytes
+    assert calls == ["labels/data/a.parquet", "labels/data/b.parquet"]
+    assert row_builds == ["labels/data/b.parquet"]
 
 
 def test_global_cli_refuses_to_start_when_storage_budget_is_not_met(

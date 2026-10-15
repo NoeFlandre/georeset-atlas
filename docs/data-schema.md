@@ -93,6 +93,11 @@ The global builder first inventories the frozen Hub tree metadata and checks tha
 ```sh
 atlas-assemble --output-dir /path/on/a/large/local/volume/atlas-v0 --dry-run
 atlas-assemble --output-dir /path/on/a/large/local/volume/atlas-v0 --max-bytes 2500000000
+atlas-assemble --output-dir /path/on/a/large/local/volume/atlas-v0 --max-new-partitions 25
 ```
 
-The dry run makes metadata requests only; it does not read Parquet rows or create the output directory. The builder stops before starting another partition if the live free-space reserve is no longer met. It writes `assembly-plan.json`, `assembly-progress.json`, and, after exact source status reconciliation, `assembly-manifest.json`.
+The dry run makes metadata requests only; it does not read Parquet rows or create the output directory. The builder stops before starting another partition if the live free-space reserve is no longer met. It writes `assembly-plan.json`, atomically checkpoints `assembly-progress.json` after each completed partition, and writes `assembly-manifest.json` only after exact source status reconciliation.
+
+`--max-new-partitions` is an optional deterministic pause point. It returns exit code 7 and records the next partition in `assembly-progress.json` after the requested number of partitions without an existing manifest complete. On resume, existing manifests are verified and counted once; they do not consume the new-partition limit. A graceful Ctrl-C during a partition records that partition as pending and returns exit code 7. An abrupt process or machine stop can leave progress at the last atomic checkpoint: a partition with a committed manifest is verified on resume, while an unfinished partition is retried. Its orphan outputs are reused only if the rebuilt contents have matching hashes; otherwise the join refuses to overwrite them. Input datasets are read-only throughout.
+
+The plan hash includes the implementation revision. Resume with the same code revision; for a code update, use a new output directory and preserve the earlier run.
