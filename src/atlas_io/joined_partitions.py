@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ from atlas_domain.joined_outputs import (
     normalize_row_index,
 )
 from atlas_domain.source_catalog import SOURCE_CATALOG, select_input_file
-from atlas_io.shard_increment import _stream_sha256, _write_atomically
+from atlas_io.shard_increment import _fsync_directory, _stream_sha256, _write_atomically
 
 MANIFEST_VERSION = 1
 PARQUET_COMPRESSION = "zstd"
@@ -49,6 +50,9 @@ _OUTPUT_KEYS = frozenset({"name", "size_bytes", "sha256", "row_count"})
 _ROW_KEY_FIELD = "text_unit_key"
 _GEOMETRY_FIELDS = frozenset({"geometry", "geometry_wkb"})
 _NON_SLUG = re.compile(r"[^a-z0-9]+")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_SHARED_SOURCE_ID = "wiki"
+_SHARED_TABLE = "polygon_document_links"
 _TABLE_TYPES: Mapping[str, Mapping[str, pa.DataType]] = {
     "labels": {
         "source_row_index": pa.int64(),
@@ -177,6 +181,11 @@ def write_joined_partition(
         raise TypeError("build must return a JoinedPartition")
     source_schemas = _source_schemas(schema_provider)
     output_dir.mkdir(parents=True, exist_ok=True)
+    publication_order = sorted(
+        OUTPUT_TABLES,
+        key=lambda table: _is_shared(source_id, table),
+        reverse=True,
+    )
     outputs = {
         table: _publish_table(
             output_dir,
@@ -184,8 +193,9 @@ def write_joined_partition(
             table,
             getattr(partition, table),
             source_schemas.get(table),
+            shared=_is_shared(source_id, table),
         )
-        for table in OUTPUT_TABLES
+        for table in publication_order
     }
     manifest: dict[str, Any] = {
         **identity,
@@ -231,11 +241,29 @@ def _verify(
                 f"not {expected!r}"
             )
     _check_manifest(manifest, manifest_path.name)
-    names = {table: f"{prefix}.{table}.parquet" for table in OUTPUT_TABLES}
+    outputs = manifest["outputs"]
+    names = {
+        table: _expected_name(prefix, identity["source_id"], table, outputs[table])
+        for table in OUTPUT_TABLES
+    }
     for table in OUTPUT_TABLES:
-        _verify_output(output_dir, manifest["outputs"][table], names[table])
+        _verify_output(output_dir, outputs[table], names[table])
     _reject_orphans(output_dir, prefix, allowed={manifest_path.name, *names.values()})
     return JoinedPartitionResult("verified", manifest, manifest_path)
+
+
+def _expected_name(
+    prefix: str,
+    source_id: str,
+    table: str,
+    output: Mapping[str, Any],
+) -> str:
+    if not _is_shared(source_id, table):
+        return f"{prefix}.{table}.parquet"
+    digest = output["sha256"]
+    if not (isinstance(digest, str) and _SHA256.fullmatch(digest)):
+        raise _conflict(f"manifest output {table} names a malformed sha256")
+    return _shared_name(digest)
 
 
 def _check_manifest(manifest: Mapping[str, Any], name: str) -> None:
@@ -316,6 +344,8 @@ def _publish_table(
     table: str,
     rows: RowSource,
     source: pa.Schema | None,
+    *,
+    shared: bool,
 ) -> dict[str, Any]:
     name = f"{prefix}.{table}.parquet"
     row_count = len(rows)
@@ -326,7 +356,31 @@ def _publish_table(
         lambda handle: _write_batches(handle, schema, _record_batches(rows, schema)),
         verify=lambda temporary: _verify_table(temporary, columns, row_count),
     )
-    return {"name": name, "size_bytes": size, "sha256": digest, "row_count": row_count}
+    output = {
+        "name": name,
+        "size_bytes": size,
+        "sha256": digest,
+        "row_count": row_count,
+    }
+    if shared:
+        return _share_table(output_dir, output)
+    return output
+
+
+def _share_table(output_dir: Path, staged: Mapping[str, Any]) -> dict[str, Any]:
+    shared = {**staged, "name": _shared_name(staged["sha256"])}
+    path = output_dir / shared["name"]
+    if path.exists():
+        try:
+            _verify_output(output_dir, shared, shared["name"])
+        except JoinedPartitionConflictError:
+            (output_dir / staged["name"]).unlink()
+            raise
+        (output_dir / staged["name"]).unlink()
+    else:
+        os.replace(output_dir / staged["name"], path)
+        _fsync_directory(output_dir)
+    return shared
 
 
 def _table_schema(table: str, rows: RowSource, source: pa.Schema | None) -> pa.Schema:
@@ -444,6 +498,14 @@ def _output_prefix(source_id: str, path: str) -> str:
 
 def _slug(value: str) -> str:
     return _NON_SLUG.sub("-", value.lower()).strip("-")
+
+
+def _is_shared(source_id: str, table: str) -> bool:
+    return (source_id, table) == (_SHARED_SOURCE_ID, _SHARED_TABLE)
+
+
+def _shared_name(digest: str) -> str:
+    return f"{_SHARED_SOURCE_ID}__{_SHARED_TABLE}.{digest}.parquet"
 
 
 def _is_count(value: object) -> bool:

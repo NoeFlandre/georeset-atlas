@@ -439,6 +439,27 @@ WIKI_SOURCE_ID = "wiki"
 WIKI_REPO_ID = "NoeFlandre/osm-polygon-wikidata-and-wikipedia-landuse"
 WIKI_REVISION = "49307aeb05b6dcc8a5d393f77f59a1e6d13a967a"
 WIKI_PATH = "labels/wikipedia/sentences/region-a.parquet"
+WIKIVOYAGE_PATH = "labels/wikivoyage/sentences/region-a.parquet"
+NATIVE_WIKI_LINKS: list[dict[str, Any]] = [
+    {
+        "document_id": "document-1",
+        "project": "wikipedia",
+        "polygon_id": "polygon-1",
+        "input_revision": "rev-1",
+    },
+    {
+        "document_id": "document-1",
+        "project": "wikipedia",
+        "polygon_id": "polygon-2",
+        "input_revision": "rev-1",
+    },
+    {
+        "document_id": "document-1",
+        "project": "wikipedia",
+        "polygon_id": "polygon-1",
+        "input_revision": "rev-2",
+    },
+]
 
 
 def _wiki_partition() -> JoinedPartition:
@@ -494,7 +515,9 @@ def test_documents_are_written_with_native_typed_columns(tmp_path: Path) -> None
     ]
 
 
-def _native_wiki_partition() -> JoinedPartition:
+def _native_wiki_partition(
+    link_rows: list[dict[str, Any]] = NATIVE_WIKI_LINKS,
+) -> JoinedPartition:
     return join_wiki_partition(
         label_rows=[
             {"sentence_id": "sentence-1", "decision": "yes", "language": "en"},
@@ -522,26 +545,7 @@ def _native_wiki_partition() -> JoinedPartition:
                 "attribution": "Wikipedia contributors",
             }
         ],
-        link_rows=[
-            {
-                "document_id": "document-1",
-                "project": "wikipedia",
-                "polygon_id": "polygon-1",
-                "input_revision": "rev-1",
-            },
-            {
-                "document_id": "document-1",
-                "project": "wikipedia",
-                "polygon_id": "polygon-2",
-                "input_revision": "rev-1",
-            },
-            {
-                "document_id": "document-1",
-                "project": "wikipedia",
-                "polygon_id": "polygon-1",
-                "input_revision": "rev-2",
-            },
-        ],
+        link_rows=link_rows,
         polygon_rows=[
             {
                 "polygon_id": "polygon-1",
@@ -594,6 +598,113 @@ def test_native_geometry_strings_are_persisted_unchanged(tmp_path: Path) -> None
         '{"type":"Point","coordinates":[69.1,34.4]}',
         '{"type":"Point","coordinates":[69.2,34.5]}',
     ]
+
+
+def _write_wiki_partition(
+    output_dir: Path,
+    path: str,
+    build: Callable[[], JoinedPartition],
+) -> JoinedPartitionResult:
+    return write_joined_partition(
+        source_id=WIKI_SOURCE_ID,
+        repo_id=WIKI_REPO_ID,
+        revision=WIKI_REVISION,
+        path=path,
+        output_dir=output_dir,
+        build=build,
+    )
+
+
+def _link_files(output_dir: Path) -> list[str]:
+    return sorted(
+        path.name
+        for path in output_dir.glob("*.parquet")
+        if "polygon_document_links" in path.name
+    )
+
+
+def _unexpected_build() -> JoinedPartition:
+    raise AssertionError("a verified rerun must not rebuild the partition")
+
+
+def test_identical_wiki_links_share_one_shard_across_label_paths(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "joined"
+    wikipedia = _write_wiki_partition(output_dir, WIKI_PATH, _native_wiki_partition)
+    wikivoyage = _write_wiki_partition(
+        output_dir, WIKIVOYAGE_PATH, _native_wiki_partition
+    )
+    written = _outputs(output_dir)
+
+    assert len(_link_files(output_dir)) == 1
+    names = {
+        result.manifest["outputs"]["polygon_document_links"]["name"]
+        for result in (wikipedia, wikivoyage)
+    }
+    assert names == set(_link_files(output_dir))
+
+    rerun_wikipedia = _write_wiki_partition(output_dir, WIKI_PATH, _unexpected_build)
+    rerun_wikivoyage = _write_wiki_partition(
+        output_dir, WIKIVOYAGE_PATH, _unexpected_build
+    )
+    statuses = (rerun_wikipedia.status, rerun_wikivoyage.status)
+
+    assert statuses == ("verified", "verified")
+    assert _outputs(output_dir) == written
+
+
+def test_distinct_wiki_links_get_distinct_content_addressed_shards(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "joined"
+    wikipedia = _write_wiki_partition(output_dir, WIKI_PATH, _native_wiki_partition)
+    preserved = _outputs(output_dir)
+
+    wikivoyage = _write_wiki_partition(
+        output_dir,
+        WIKIVOYAGE_PATH,
+        lambda: _native_wiki_partition(NATIVE_WIKI_LINKS[:2]),
+    )
+
+    links = [
+        result.manifest["outputs"]["polygon_document_links"]
+        for result in (wikipedia, wikivoyage)
+    ]
+    assert links[0]["name"] != links[1]["name"]
+    assert sorted(link["name"] for link in links) == _link_files(output_dir)
+    for link in links:
+        assert link["sha256"] in link["name"]
+    after = _outputs(output_dir)
+    assert {name: after[name] for name in preserved} == preserved
+
+
+def test_conflicting_shared_shard_is_preserved_and_no_manifest_is_written(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "joined"
+    wikipedia = _write_wiki_partition(output_dir, WIKI_PATH, _native_wiki_partition)
+    links = wikipedia.manifest["outputs"]["polygon_document_links"]
+    shard = output_dir / links["name"]
+    corrupted = bytearray(shard.read_bytes())
+    corrupted[len(corrupted) // 2] ^= 0x01
+    shard.write_bytes(bytes(corrupted))
+    preserved = _outputs(output_dir)
+
+    with pytest.raises(JoinedPartitionConflictError, match="sha256"):
+        _write_wiki_partition(output_dir, WIKIVOYAGE_PATH, _native_wiki_partition)
+
+    after = _outputs(output_dir)
+    assert after == preserved
+    assert len(list(output_dir.glob("*.manifest.json"))) == 1
+
+
+def test_non_wiki_links_keep_the_per_partition_name(tmp_path: Path) -> None:
+    result = _write(tmp_path / "joined", CountingBuild())
+
+    assert result.manifest["outputs"]["polygon_document_links"]["name"] == (
+        "description__labels-language-v1-data-region-a.polygon_document_links.parquet"
+    )
 
 
 class ScanCounter:

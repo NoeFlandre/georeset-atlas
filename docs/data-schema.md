@@ -82,6 +82,6 @@ The audit records these field names: `sentence_index`, `split_status`, `original
 2. In the Afghanistan Description pilot, 31 of 215 labels have `split_status` `unsupported_language`. All 31 use index 0.
 3. A joined row keeps its raw split status. The status `unsupported_language` is treated as unsplit.
 4. The native Website polygon schema has field-specific statuses. It has no generic `decision` column.
-5. Wiki pilot outputs copy the full regional `polygon_document_links` table into each project partition. The Wikipedia and Wikivoyage pilot manifests each list 1,806 links. Full assembly must store shared link shards once.
+5. Wiki output manifests reference content-addressed `polygon_document_links` shards. Identical Parquet bytes share one physical shard across Wikipedia and Wikivoyage; distinct contents use distinct shards. Regression tests cover this writer behavior, but global link-shard reconciliation has not run.
 6. Wiki viewer language codes do not match the Wiki language-split directories. See [Methods](methods.md).
 7. Pilot joins cover Afghanistan only. They are not full-source results.
