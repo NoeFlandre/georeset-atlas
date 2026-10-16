@@ -3,6 +3,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 _MAX_ROW_ORDINAL = 2**63 - 1
+_MAX_JOIN_INDEX_CACHE_KIB = 32_768
 
 type JoinKey = int | str | tuple[JoinKey, ...]
 
@@ -62,6 +63,7 @@ class _SQLiteFile:
 class DiskJoinIndex(_SQLiteFile):
     def __init__(self, path: str | Path) -> None:
         super().__init__(path)
+        self._connection.execute(f"PRAGMA cache_size = -{_MAX_JOIN_INDEX_CACHE_KIB}")
         self._connection.execute(
             "CREATE TABLE IF NOT EXISTS row_occurrences "
             "(sequence INTEGER PRIMARY KEY, key BLOB NOT NULL, "

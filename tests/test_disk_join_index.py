@@ -1,3 +1,4 @@
+import hashlib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -5,6 +6,44 @@ from typing import Any
 import pytest
 
 from atlas_io.disk_join_index import DiskJoinIndex, DiskMembershipSet
+
+
+def _unique_rows_hash(index: DiskJoinIndex) -> str:
+    digest = hashlib.sha256()
+    for key, row_ordinal in index._connection.execute(
+        "SELECT key, row_ordinal FROM unique_rows ORDER BY row_ordinal"
+    ):
+        digest.update(bytes(key))
+        digest.update(int(row_ordinal).to_bytes(8, "little"))
+    return digest.hexdigest()
+
+
+def test_unique_index_cache_is_bounded_and_reapplied_after_reopen(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unique-cache.sqlite"
+    keys = [("wiki-sentence", f"Q{value:04d}") for value in (4, 1, 9, 2, 7)]
+    index = DiskJoinIndex(path)
+    assert index._connection.execute("PRAGMA cache_size").fetchone()[0] == -32_768
+
+    for row_ordinal, key in enumerate(keys):
+        index.add_unique(key, row_ordinal)
+    index.commit()
+    expected_hash = _unique_rows_hash(index)
+    index.close()
+
+    reopened = DiskJoinIndex(path)
+    assert reopened._connection.execute("PRAGMA cache_size").fetchone()[0] == -32_768
+    assert [reopened.lookup_unique(key) for key in keys] == list(range(len(keys)))
+    assert _unique_rows_hash(reopened) == expected_hash
+    plan = reopened._connection.execute(
+        "EXPLAIN QUERY PLAN SELECT row_ordinal FROM unique_rows WHERE key = ?",
+        (b"probe",),
+    ).fetchall()
+    assert any("unique_rows" in str(row[-1]) for row in plan)
+    with pytest.raises(ValueError, match="duplicate unique key"):
+        reopened.add_unique(keys[0], len(keys))
+    reopened.close()
 
 
 def test_join_index_persists_ordered_occurrences_and_typed_keys(
