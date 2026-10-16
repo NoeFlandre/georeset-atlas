@@ -697,3 +697,293 @@ def test_global_cli_does_not_write_complete_manifest_when_totals_mismatch(
     progress = json.loads((output_dir / "assembly-progress.json").read_text())
     assert progress["status"] == "reconciliation_failed"
     assert not (output_dir / "assembly-manifest.json").exists()
+
+
+def _legacy_plan_document(
+    source: SourceDataset,
+    files: tuple[HubParquetFile, ...],
+) -> dict[str, Any]:
+    plan = assembly_cli.build_assembly_plan((source,), files)
+    budget = assembly_cli.estimate_storage_budget(plan)
+    document = assembly_cli._plan_document((source,), plan, budget)
+    document.pop("execution_identity", None)
+    document.pop("execution_identity_sha256", None)
+    document.pop("legacy_checkpoint", None)
+    return document
+
+
+def test_legacy_checkpoint_requires_explicit_acceptance_and_migrates_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source()
+    files = _files()
+    monkeypatch.setattr(assembly_cli, "SOURCE_CATALOG", (source,))
+    monkeypatch.setattr(
+        assembly_cli, "fetch_pinned_files", lambda *_args, **_kwargs: files
+    )
+    monkeypatch.setattr(
+        assembly_cli, "run_joined_partition", lambda *_args, **_kwargs: 0
+    )
+    output_dir = tmp_path / "legacy-assembly"
+    output_dir.mkdir()
+    legacy_plan = _legacy_plan_document(source, files)
+    plan_path = output_dir / "assembly-plan.json"
+    plan_path.write_bytes(assembly_cli._canonical_json(legacy_plan))
+    original_plan_sha256 = legacy_plan["plan_sha256"]
+    _write_manifest(
+        output_dir,
+        status_counts={"yes": 1, "no": 1, "failed": 1, "skipped": 1},
+    )
+
+    assert (
+        assembly_cli.main(["--output-dir", str(output_dir)])
+        == assembly_cli.EXIT_CONFLICT
+    )
+    assert json.loads(plan_path.read_text()) == legacy_plan
+
+    assert (
+        assembly_cli.main(
+            ["--output-dir", str(output_dir), "--allow-legacy-checkpoint"]
+        )
+        == assembly_cli.EXIT_OK
+    )
+
+    migrated = json.loads(plan_path.read_text())
+    progress = json.loads((output_dir / "assembly-progress.json").read_text())
+    manifest = json.loads((output_dir / "assembly-manifest.json").read_text())
+    assert migrated["plan_sha256"] == original_plan_sha256
+    assert migrated["legacy_checkpoint"]["prior_plan_sha256"] == original_plan_sha256
+    assert migrated["execution_identity"]["input_plan_sha256"]
+    assert progress["execution_identity"] == migrated["execution_identity"]
+    assert (
+        progress["execution_identity_sha256"] == migrated["execution_identity_sha256"]
+    )
+    assert manifest["execution_identity"] == migrated["execution_identity"]
+    assert assembly_cli.main(["--output-dir", str(output_dir)]) == assembly_cli.EXIT_OK
+    assert json.loads(plan_path.read_text()) == migrated
+
+
+def test_legacy_checkpoint_rejects_changed_inputs_without_rewriting_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source()
+    original_files = _files()
+    monkeypatch.setattr(assembly_cli, "SOURCE_CATALOG", (source,))
+    monkeypatch.setattr(
+        assembly_cli, "fetch_pinned_files", lambda *_args, **_kwargs: original_files
+    )
+    output_dir = tmp_path / "legacy-assembly"
+    output_dir.mkdir()
+    legacy_plan = _legacy_plan_document(source, original_files)
+    plan_path = output_dir / "assembly-plan.json"
+    plan_path.write_bytes(assembly_cli._canonical_json(legacy_plan))
+    original_bytes = plan_path.read_bytes()
+    changed_files = (
+        HubParquetFile("fixture", "labels", "labels/data/a.parquet", 101),
+        *original_files[1:],
+    )
+    monkeypatch.setattr(
+        assembly_cli, "fetch_pinned_files", lambda *_args, **_kwargs: changed_files
+    )
+
+    assert (
+        assembly_cli.main(
+            ["--output-dir", str(output_dir), "--allow-legacy-checkpoint"]
+        )
+        == assembly_cli.EXIT_CONFLICT
+    )
+    assert plan_path.read_bytes() == original_bytes
+
+
+def test_execution_identity_change_rejects_resume_even_with_legacy_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source()
+    monkeypatch.setattr(assembly_cli, "SOURCE_CATALOG", (source,))
+    monkeypatch.setattr(
+        assembly_cli, "fetch_pinned_files", lambda *_args, **_kwargs: _files()
+    )
+
+    def runner(argv: list[str], *, opener: Any = None) -> int:
+        _write_manifest(
+            Path(argv[argv.index("--output-dir") + 1]),
+            status_counts={"yes": 1, "no": 1, "failed": 1, "skipped": 1},
+        )
+        return 0
+
+    monkeypatch.setattr(assembly_cli, "run_joined_partition", runner)
+    output_dir = tmp_path / "identity-assembly"
+    assert assembly_cli.main(["--output-dir", str(output_dir)]) == assembly_cli.EXIT_OK
+    plan_path = output_dir / "assembly-plan.json"
+    original_bytes = plan_path.read_bytes()
+
+    monkeypatch.setattr(
+        assembly_cli, "_source_tree_sha256", lambda _root: "f" * 64, raising=False
+    )
+
+    assert (
+        assembly_cli.main(
+            ["--output-dir", str(output_dir), "--allow-legacy-checkpoint"]
+        )
+        == assembly_cli.EXIT_CONFLICT
+    )
+    assert plan_path.read_bytes() == original_bytes
+
+
+def test_dry_run_reports_model_input_device_and_batch_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = _source()
+    monkeypatch.setattr(assembly_cli, "SOURCE_CATALOG", (source,))
+    monkeypatch.setattr(
+        assembly_cli, "fetch_pinned_files", lambda *_args, **_kwargs: _files()
+    )
+    output_dir = tmp_path / "identity-dry-run"
+
+    assert (
+        assembly_cli.main(
+            [
+                "--output-dir",
+                str(output_dir),
+                "--max-bytes",
+                "8192",
+                "--dry-run",
+            ]
+        )
+        == assembly_cli.EXIT_OK
+    )
+
+    summary = json.loads(capsys.readouterr().out)
+    identity = summary["execution_identity"]
+    assert identity["assembly_version"] == assembly_cli.ASSEMBLY_VERSION
+    assert identity["schema_version"] == assembly_cli.SCHEMA_VERSION
+    assert len(identity["input_plan_sha256"]) == 64
+    assert len(identity["source_tree_sha256"]) == 64
+    assert identity["device_kind"] == "cpu"
+    assert identity["historical_label_model_identity"] is None
+    assert identity["historical_label_model_status"] == (
+        "unknown_not_evidenced_in_provenance"
+    )
+    assert identity["max_bytes"] == 8192
+    assert identity["sqlite_batch_rows"] > 0
+    assert identity["output_batch_rows"] > 0
+    assert identity["output_batch_bytes"] > 0
+    assert summary["execution_identity_sha256"]
+    assert not output_dir.exists()
+
+
+def test_legacy_completed_manifest_migrates_only_with_explicit_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source()
+    files = _files()
+    monkeypatch.setattr(assembly_cli, "SOURCE_CATALOG", (source,))
+    monkeypatch.setattr(
+        assembly_cli, "fetch_pinned_files", lambda *_args, **_kwargs: files
+    )
+
+    def runner(argv: list[str], *, opener: Any = None) -> int:
+        _write_manifest(
+            Path(argv[argv.index("--output-dir") + 1]),
+            status_counts={"yes": 1, "no": 1, "failed": 1, "skipped": 1},
+        )
+        return 0
+
+    monkeypatch.setattr(assembly_cli, "run_joined_partition", runner)
+    output_dir = tmp_path / "legacy-complete"
+    assert assembly_cli.main(["--output-dir", str(output_dir)]) == assembly_cli.EXIT_OK
+
+    plan_path = output_dir / "assembly-plan.json"
+    plan = json.loads(plan_path.read_text())
+    original_plan_sha256 = plan["plan_sha256"]
+    plan.pop("execution_identity")
+    plan.pop("execution_identity_sha256")
+    plan_path.write_bytes(assembly_cli._canonical_json(plan))
+
+    manifest_path = output_dir / "assembly-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("execution_identity")
+    manifest.pop("execution_identity_sha256")
+    manifest_path.write_bytes(assembly_cli._canonical_json(manifest))
+
+    assert (
+        assembly_cli.main(
+            ["--output-dir", str(output_dir), "--allow-legacy-checkpoint"]
+        )
+        == assembly_cli.EXIT_OK
+    )
+
+    migrated_plan = json.loads(plan_path.read_text())
+    migrated_manifest = json.loads(manifest_path.read_text())
+    assert migrated_plan["plan_sha256"] == original_plan_sha256
+    assert migrated_manifest["plan_sha256"] == original_plan_sha256
+    assert (
+        migrated_manifest["execution_identity"] == migrated_plan["execution_identity"]
+    )
+    assert "legacy_checkpoint" in migrated_manifest
+
+
+def test_source_tree_identity_covers_source_and_ignores_generated_files(
+    tmp_path: Path,
+) -> None:
+    from atlas_io.execution_identity import source_tree_sha256
+
+    source = tmp_path / "src" / "atlas_io" / "module.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("VALUE = 1\n")
+    (tmp_path / "pyproject.toml").write_text("[project]\nversion = '1'\n")
+    (tmp_path / "uv.lock").write_text("version = 1\n")
+    original = source_tree_sha256(tmp_path)
+
+    (source.parent / "__pycache__").mkdir()
+    (source.parent / "__pycache__" / "module.pyc").write_bytes(b"generated")
+    assert source_tree_sha256(tmp_path) == original
+    source.write_text("VALUE = 2\n")
+    assert source_tree_sha256(tmp_path) != original
+
+
+def test_source_tree_identity_supports_installed_package_layout(
+    tmp_path: Path,
+) -> None:
+    from atlas_io.execution_identity import source_tree_sha256
+
+    package = tmp_path / "site-packages"
+    (package / "atlas_io").mkdir(parents=True)
+    (package / "atlas_domain").mkdir()
+    (package / "atlas_io" / "module.py").write_text("VALUE = 1\n")
+    (package / "atlas_domain" / "module.py").write_text("VALUE = 2\n")
+
+    assert len(source_tree_sha256(package)) == 64
+
+
+def test_dry_run_reports_source_identity_read_error_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = _source()
+    monkeypatch.setattr(assembly_cli, "SOURCE_CATALOG", (source,))
+    monkeypatch.setattr(
+        assembly_cli, "fetch_pinned_files", lambda *_args, **_kwargs: _files()
+    )
+
+    def fail_identity(_repository: Path) -> str:
+        raise OSError("source tree unavailable")
+
+    monkeypatch.setattr(assembly_cli, "_source_tree_sha256", fail_identity)
+    output_dir = tmp_path / "identity-error"
+
+    assert (
+        assembly_cli.main(["--output-dir", str(output_dir), "--dry-run"])
+        == assembly_cli.EXIT_INPUT
+    )
+    assert (
+        "execution identity error: source tree unavailable" in capsys.readouterr().err
+    )
+    assert not output_dir.exists()

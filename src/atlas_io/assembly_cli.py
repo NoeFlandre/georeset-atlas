@@ -17,6 +17,12 @@ from typing import Any
 
 from atlas_domain.joined_outputs import STATUSES
 from atlas_domain.source_catalog import SOURCE_CATALOG, SourceDataset
+from atlas_io.execution_identity import (
+    create_execution_identity,
+    execution_identity_sha256,
+    input_plan_sha256,
+)
+from atlas_io.execution_identity import source_tree_sha256 as _source_tree_sha256
 from atlas_io.hub_inventory import (
     AssemblyPartition,
     AssemblyPlan,
@@ -96,6 +102,14 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help=("fetch pinned metadata and report storage needs without writing files"),
     )
+    parser.add_argument(
+        "--allow-legacy-checkpoint",
+        action="store_true",
+        help=(
+            "accept a checkpoint with no recorded code/runtime/device/batching "
+            "identity after its pinned input inventory matches the current plan"
+        ),
+    )
     return parser
 
 
@@ -118,8 +132,36 @@ def _implementation_revision() -> str:
     return revision
 
 
+def _plan_body_document(document: dict[str, Any]) -> dict[str, Any]:
+    metadata = {
+        "plan_sha256",
+        "execution_identity",
+        "execution_identity_sha256",
+        "legacy_checkpoint",
+    }
+    return {key: value for key, value in document.items() if key not in metadata}
+
+
+def _plan_digest(document: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json(_plan_body_document(document))).hexdigest()
+
+
+def _same_plan_except_revision(
+    existing: dict[str, Any], expected: dict[str, Any]
+) -> bool:
+    existing_body = _plan_body_document(existing)
+    expected_body = _plan_body_document(expected)
+    existing_body.pop("implementation_revision", None)
+    expected_body.pop("implementation_revision", None)
+    return existing_body == expected_body
+
+
 def _plan_document(
-    sources: Sequence[SourceDataset], plan: AssemblyPlan, budget: StorageBudget
+    sources: Sequence[SourceDataset],
+    plan: AssemblyPlan,
+    budget: StorageBudget,
+    *,
+    max_bytes: int = DEFAULT_MAX_BYTES,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "assembly_version": ASSEMBLY_VERSION,
@@ -142,8 +184,21 @@ def _plan_document(
         "largest_partition": asdict(plan.largest_partition),
         "storage_budget": asdict(budget),
     }
-    digest = hashlib.sha256(_canonical_json(body)).hexdigest()
-    return {**body, "plan_sha256": digest}
+    module_path = Path(__file__).resolve()
+    repository = module_path.parents[2]
+    if not (repository / "src").is_dir():
+        repository = module_path.parents[1]
+    identity = create_execution_identity(
+        body,
+        max_bytes=max_bytes,
+        source_sha256=_source_tree_sha256(repository),
+    )
+    return {
+        **body,
+        "plan_sha256": hashlib.sha256(_canonical_json(body)).hexdigest(),
+        "execution_identity": asdict(identity),
+        "execution_identity_sha256": execution_identity_sha256(identity),
+    }
 
 
 def _existing_disk_path(path: Path) -> Path:
@@ -238,27 +293,160 @@ def _start_partition_heartbeat(
     return stopped, thread, write, update_stage
 
 
-def _prepare_plan(output_dir: Path, plan: dict[str, Any]) -> None:
+def _read_existing_plan(path: Path) -> dict[str, Any]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise AssemblyConflictError(
+            f"cannot read valid existing {path.name}: {error}"
+        ) from error
+    if not isinstance(document, dict):
+        raise AssemblyConflictError(f"existing {path.name} is not an object")
+    return document
+
+
+def _validate_plan_digest(path: Path, document: dict[str, Any]) -> str:
+    digest = document.get("plan_sha256")
+    if not isinstance(digest, str) or _plan_digest(document) != digest:
+        raise AssemblyConflictError(
+            f"existing {path.name} checksum does not match its contents"
+        )
+    return digest
+
+
+def _validate_pinned_input(
+    path: Path,
+    existing: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    try:
+        existing_digest = input_plan_sha256(existing)
+    except (KeyError, TypeError) as error:
+        raise AssemblyConflictError(
+            f"existing {path.name} has no valid pinned input inventory"
+        ) from error
+    expected_digest = expected["execution_identity"]["input_plan_sha256"]
+    if existing_digest != expected_digest:
+        raise AssemblyConflictError(
+            "existing assembly plan does not match the pinned input inventory"
+        )
+
+
+def _migrate_legacy_plan(
+    path: Path,
+    existing: dict[str, Any],
+    expected: dict[str, Any],
+    prior_digest: str,
+    *,
+    allow_legacy_checkpoint: bool,
+) -> dict[str, Any]:
+    if not allow_legacy_checkpoint:
+        raise AssemblyConflictError(
+            f"existing {path.name} has no execution identity "
+            "(prior code/runtime/device/batching identity is unknown); pass "
+            "--allow-legacy-checkpoint to adopt it after input validation"
+        )
+    if not _same_plan_except_revision(existing, expected):
+        raise AssemblyConflictError(
+            "legacy assembly plan differs in schema, inventory, or storage budget"
+        )
+    legacy_checkpoint = {
+        "prior_plan_sha256": prior_digest,
+        "prior_implementation_revision": existing.get("implementation_revision"),
+        "prior_identity_available": False,
+        "accepted_execution_identity_sha256": expected["execution_identity_sha256"],
+        "accepted_by": "--allow-legacy-checkpoint",
+    }
+    migrated = {
+        **existing,
+        "execution_identity": expected["execution_identity"],
+        "execution_identity_sha256": expected["execution_identity_sha256"],
+        "legacy_checkpoint": legacy_checkpoint,
+    }
+    _write_json_atomic(path, _canonical_json(migrated))
+    return migrated
+
+
+def _validate_current_identity(
+    path: Path,
+    existing: dict[str, Any],
+    expected: dict[str, Any],
+    identity: object,
+    identity_digest: object,
+) -> dict[str, Any]:
+    if not isinstance(identity, dict) or not isinstance(identity_digest, str):
+        raise AssemblyConflictError(
+            f"existing {path.name} has malformed execution identity metadata"
+        )
+    if execution_identity_sha256(identity) != identity_digest:
+        raise AssemblyConflictError(
+            f"existing {path.name} execution identity checksum is invalid"
+        )
+    if identity_digest != expected["execution_identity_sha256"]:
+        raise AssemblyConflictError(
+            "existing assembly plan has a different code, runtime, device, "
+            "input, or batching identity"
+        )
+    if not _same_plan_except_revision(existing, expected):
+        raise AssemblyConflictError(
+            "existing assembly plan differs beyond its Git revision"
+        )
+    return existing
+
+
+def _prepare_existing_plan(
+    path: Path,
+    expected: dict[str, Any],
+    *,
+    allow_legacy_checkpoint: bool,
+) -> dict[str, Any]:
+    existing = _read_existing_plan(path)
+    prior_digest = _validate_plan_digest(path, existing)
+    _validate_pinned_input(path, existing, expected)
+
+    has_identity = "execution_identity" in existing
+    has_identity_digest = "execution_identity_sha256" in existing
+    if has_identity != has_identity_digest:
+        raise AssemblyConflictError(
+            f"existing {path.name} has incomplete execution identity metadata"
+        )
+    if not has_identity:
+        return _migrate_legacy_plan(
+            path,
+            existing,
+            expected,
+            prior_digest,
+            allow_legacy_checkpoint=allow_legacy_checkpoint,
+        )
+    return _validate_current_identity(
+        path,
+        existing,
+        expected,
+        existing["execution_identity"],
+        existing["execution_identity_sha256"],
+    )
+
+
+def _prepare_plan(
+    output_dir: Path,
+    plan: dict[str, Any],
+    *,
+    allow_legacy_checkpoint: bool = False,
+) -> dict[str, Any]:
     plan_path = output_dir / _PLAN_FILE
-    expected = _canonical_json(plan)
     if plan_path.exists():
-        try:
-            existing = plan_path.read_bytes()
-        except OSError as error:
-            raise AssemblyConflictError(
-                f"cannot read existing {plan_path.name}: {error}"
-            ) from error
-        if existing != expected:
-            raise AssemblyConflictError(
-                f"existing {plan_path.name} does not match the pinned input inventory"
-            )
-        return
+        return _prepare_existing_plan(
+            plan_path,
+            plan,
+            allow_legacy_checkpoint=allow_legacy_checkpoint,
+        )
     if any(output_dir.iterdir()):
         raise AssemblyConflictError(
             f"output directory {output_dir} is non-empty and has no matching "
             "assembly plan"
         )
-    _write_json_atomic(plan_path, expected)
+    _write_json_atomic(plan_path, _canonical_json(plan))
+    return plan
 
 
 def _status_zeroes() -> dict[str, int]:
@@ -334,7 +522,7 @@ def _expected_totals(sources: Sequence[SourceDataset]) -> dict[str, dict[str, in
 
 def _progress_payload(
     *,
-    plan_sha256: str,
+    plan_document: dict[str, Any],
     status: str,
     partitions_completed: int,
     partitions_total: int,
@@ -345,13 +533,17 @@ def _progress_payload(
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "assembly_version": ASSEMBLY_VERSION,
-        "plan_sha256": plan_sha256,
+        "plan_sha256": plan_document["plan_sha256"],
+        "execution_identity": plan_document["execution_identity"],
+        "execution_identity_sha256": plan_document["execution_identity_sha256"],
         "status": status,
         "partitions_completed": partitions_completed,
         "partitions_total": partitions_total,
         "sources": sources,
         "unique_output_bytes": output_bytes,
     }
+    if "legacy_checkpoint" in plan_document:
+        payload["legacy_checkpoint"] = plan_document["legacy_checkpoint"]
     if error is not None:
         payload["error"] = error
     if pending_partition is not None:
@@ -435,7 +627,14 @@ def main(
         print(f"atlas-assemble: inventory error: {error}", file=sys.stderr)
         return EXIT_INPUT
 
-    plan_doc = _plan_document(SOURCE_CATALOG, plan, budget)
+    try:
+        plan_doc = _plan_document(
+            SOURCE_CATALOG, plan, budget, max_bytes=args.max_bytes
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"atlas-assemble: execution identity error: {error}", file=sys.stderr)
+        return EXIT_INPUT
+
     try:
         free, required = _check_budget(
             args.output_dir,
@@ -449,6 +648,8 @@ def main(
     if args.dry_run:
         summary = {
             "plan_sha256": plan_doc["plan_sha256"],
+            "execution_identity": plan_doc["execution_identity"],
+            "execution_identity_sha256": plan_doc["execution_identity_sha256"],
             "partitions": plan.partition_count,
             "inventory_files": len(plan.files),
             "unique_source_bytes": plan.unique_source_bytes,
@@ -464,11 +665,21 @@ def main(
 
     try:
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        _prepare_plan(args.output_dir, plan_doc)
+        plan_doc = _prepare_plan(
+            args.output_dir,
+            plan_doc,
+            allow_legacy_checkpoint=args.allow_legacy_checkpoint,
+        )
     except (OSError, AssemblyConflictError) as error:
         print(f"atlas-assemble: output conflict: {error}", file=sys.stderr)
         return EXIT_CONFLICT
 
+    if "legacy_checkpoint" in plan_doc:
+        print(
+            "ASSEMBLY_LEGACY_CHECKPOINT_ACCEPTED "
+            + json.dumps(plan_doc["legacy_checkpoint"], sort_keys=True),
+            flush=True,
+        )
     source_by_id = {source.source_id: source for source in SOURCE_CATALOG}
     totals = _expected_totals(SOURCE_CATALOG)
     source_progress: dict[str, dict[str, Any]] = {
@@ -496,6 +707,7 @@ def main(
         + json.dumps(
             {
                 "plan_sha256": plan_doc["plan_sha256"],
+                "execution_identity_sha256": plan_doc["execution_identity_sha256"],
                 "partitions": plan.partition_count,
                 "unique_source_bytes": plan.unique_source_bytes,
                 "execution_transfer_bytes": plan.execution_transfer_bytes,
@@ -518,7 +730,7 @@ def main(
             )
         except (OSError, StorageBudgetError) as error:
             payload = _progress_payload(
-                plan_sha256=plan_doc["plan_sha256"],
+                plan_document=plan_doc,
                 status="interrupted_budget",
                 partitions_completed=completed,
                 partitions_total=plan.partition_count,
@@ -568,7 +780,7 @@ def main(
             heartbeat_thread.join()
             heartbeat_write("paused", "join")
             payload = _progress_payload(
-                plan_sha256=plan_doc["plan_sha256"],
+                plan_document=plan_doc,
                 status="paused",
                 partitions_completed=completed,
                 partitions_total=plan.partition_count,
@@ -605,7 +817,7 @@ def main(
                 error_message = f"{error_message}: {detail}"
             heartbeat_write("failed", "join", error_message)
             payload = _progress_payload(
-                plan_sha256=plan_doc["plan_sha256"],
+                plan_document=plan_doc,
                 status="interrupted_partition",
                 partitions_completed=completed,
                 partitions_total=plan.partition_count,
@@ -654,7 +866,7 @@ def main(
             )
         except (OSError, StorageBudgetError) as error:
             progress = _progress_payload(
-                plan_sha256=plan_doc["plan_sha256"],
+                plan_document=plan_doc,
                 status="interrupted_budget",
                 partitions_completed=completed,
                 partitions_total=plan.partition_count,
@@ -671,7 +883,7 @@ def main(
             )
             return EXIT_BUDGET
         progress = _progress_payload(
-            plan_sha256=plan_doc["plan_sha256"],
+            plan_document=plan_doc,
             status="running",
             partitions_completed=completed,
             partitions_total=plan.partition_count,
@@ -686,7 +898,7 @@ def main(
         ):
             next_partition = plan.partitions[completed]
             paused = _progress_payload(
-                plan_sha256=plan_doc["plan_sha256"],
+                plan_document=plan_doc,
                 status="paused",
                 partitions_completed=completed,
                 partitions_total=plan.partition_count,
@@ -748,7 +960,7 @@ def main(
     }
     if mismatches:
         payload = _progress_payload(
-            plan_sha256=plan_doc["plan_sha256"],
+            plan_document=plan_doc,
             status="reconciliation_failed",
             partitions_completed=completed,
             partitions_total=plan.partition_count,
@@ -769,6 +981,8 @@ def main(
         "data_version": DATA_VERSION,
         "implementation_revision": plan_doc["implementation_revision"],
         "plan_sha256": plan_doc["plan_sha256"],
+        "execution_identity": plan_doc["execution_identity"],
+        "execution_identity_sha256": plan_doc["execution_identity_sha256"],
         "status": "complete",
         "partitions_completed": completed,
         "partitions_total": plan.partition_count,
@@ -778,19 +992,37 @@ def main(
         "unique_output_row_counts": output_rows,
         "sources": source_progress,
     }
+    if "legacy_checkpoint" in plan_doc:
+        manifest["legacy_checkpoint"] = plan_doc["legacy_checkpoint"]
     assembly_payload = _canonical_json(manifest)
     assembly_path = args.output_dir / _MANIFEST_FILE
     if assembly_path.exists() and assembly_path.read_bytes() != assembly_payload:
-        print(
-            "atlas-assemble: existing assembly manifest conflicts with "
-            "reconciled result",
-            file=sys.stderr,
-        )
-        return EXIT_CONFLICT
-    if not assembly_path.exists():
+        try:
+            existing_manifest = json.loads(assembly_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            existing_manifest = None
+        old_manifest = {
+            key: value
+            for key, value in manifest.items()
+            if key
+            not in {
+                "execution_identity",
+                "execution_identity_sha256",
+                "legacy_checkpoint",
+            }
+        }
+        if not ("legacy_checkpoint" in plan_doc and existing_manifest == old_manifest):
+            print(
+                "atlas-assemble: existing assembly manifest conflicts with "
+                "reconciled result",
+                file=sys.stderr,
+            )
+            return EXIT_CONFLICT
+        _write_json_atomic(assembly_path, assembly_payload)
+    elif not assembly_path.exists():
         _write_json_atomic(assembly_path, assembly_payload)
     complete = _progress_payload(
-        plan_sha256=plan_doc["plan_sha256"],
+        plan_document=plan_doc,
         status="complete",
         partitions_completed=completed,
         partitions_total=plan.partition_count,
