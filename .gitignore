@@ -11,3 +11,6 @@ dist/
 .coverage
 coverage.xml
 site/
+.audit/
+.claude/
+.DS_Store
