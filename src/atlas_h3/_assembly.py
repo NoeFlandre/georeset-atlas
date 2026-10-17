@@ -20,6 +20,12 @@ TABLES = (
     "polygon_document_links",
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_PLAN_METADATA_FIELDS = {
+    "plan_sha256",
+    "execution_identity",
+    "execution_identity_sha256",
+    "legacy_checkpoint",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +57,9 @@ def load_verified_assembly(assembly_dir: Path) -> VerifiedAssembly:
     plan_sha256 = plan.get("plan_sha256")
     if not isinstance(plan_sha256, str) or not _SHA256.fullmatch(plan_sha256):
         raise AtlasH3InputError("assembly plan has a malformed plan_sha256")
-    plan_body = {key: value for key, value in plan.items() if key != "plan_sha256"}
+    plan_body = {
+        key: value for key, value in plan.items() if key not in _PLAN_METADATA_FIELDS
+    }
     computed_plan_sha256 = hashlib.sha256(_canonical_json(plan_body)).hexdigest()
     if plan_sha256 != computed_plan_sha256:
         raise AtlasH3InputError("assembly plan sha256 does not match its contents")
