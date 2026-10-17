@@ -89,7 +89,8 @@ class _AssociatedPolygonRows:
 
     def __iter__(self) -> Iterator[Row]:
         occurrences = self._index.iter_row_occurrences_for_keys(
-            (_POLYGON_ASSOCIATION, association) for association in self._associations
+            ((_POLYGON_ASSOCIATION, association) for association in self._associations),
+            max_unique_keys=len(self._associations),
         )
         while batch := list(islice(occurrences, _BATCH_ROWS)):
             yield from self._polygons.read_many(
@@ -318,7 +319,9 @@ def _polygon_ids_for_associations(
     polygon_ids_by_key: dict[JoinKey, list[str]] = {
         key: [] for key in association_keys.values()
     }
-    occurrences = index.iter_row_occurrences_for_keys(association_keys.values())
+    occurrences = index.iter_row_occurrences_for_keys(
+        association_keys.values(), max_unique_keys=len(association_keys)
+    )
     while batch := list(islice(occurrences, _BATCH_ROWS)):
         polygon_rows = polygons.read_many([row_ordinal for _, row_ordinal in batch])
         for (key, _), polygon in zip(batch, polygon_rows, strict=True):
@@ -851,20 +854,28 @@ def _join_wiki_batch(
     sentence_ordinals: Mapping[str, int] | None = None,
 ) -> _WikiJoinBatch:
     selected_sentence_ordinals: dict[str, int] = {}
-    for label in labels:
-        sentence_id = _identifier(label, "sentence_id", "label")
-        if sentence_id in selected_sentence_ordinals:
-            continue
-        if sentence_ordinals is None:
-            ordinal = index.lookup_unique((_WIKI_SENTENCE_ID, sentence_id))
-        else:
+    sentence_ids = list(
+        dict.fromkeys(_identifier(label, "sentence_id", "label") for label in labels)
+    )
+    if sentence_ordinals is None:
+        sentence_lookups = index.iter_lookup_unique(
+            (_WIKI_SENTENCE_ID, sentence_id) for sentence_id in sentence_ids
+        )
+        for sentence_id, (_, ordinal) in zip(
+            sentence_ids, sentence_lookups, strict=True
+        ):
+            if ordinal is None:
+                raise DataJoinError(f"label has no wiki sentence {sentence_id!r}")
+            selected_sentence_ordinals[sentence_id] = ordinal
+    else:
+        for sentence_id in sentence_ids:
             ordinal = sentence_ordinals.get(sentence_id)
-        if ordinal is None:
-            raise DataJoinError(f"label has no wiki sentence {sentence_id!r}")
-        selected_sentence_ordinals[sentence_id] = ordinal
+            if ordinal is None:
+                raise DataJoinError(f"label has no wiki sentence {sentence_id!r}")
+            selected_sentence_ordinals[sentence_id] = ordinal
 
     sentence_rows = sentences.read_many(selected_sentence_ordinals.values())
-    document_ordinals: dict[tuple[str, str], int] = {}
+    sentence_by_document: dict[tuple[str, str], str] = {}
     for sentence_id, sentence in zip(
         selected_sentence_ordinals, sentence_rows, strict=True
     ):
@@ -872,28 +883,49 @@ def _join_wiki_batch(
             _identifier(sentence, "document_id", "sentence"),
             _identifier(sentence, "project", "sentence"),
         )
-        if key in document_ordinals:
-            continue
-        ordinal = index.lookup_unique((_WIKI_DOCUMENT_PROJECT, *key))
+        sentence_by_document.setdefault(key, sentence_id)
+
+    document_lookup_keys = {
+        (_WIKI_DOCUMENT_PROJECT, *key): key for key in sentence_by_document
+    }
+    document_ordinals: dict[tuple[str, str], int] = {}
+    document_lookups = index.iter_lookup_unique(document_lookup_keys)
+    for key, (_, ordinal) in zip(sentence_by_document, document_lookups, strict=True):
         if ordinal is None:
-            raise DataJoinError(f"sentence {sentence_id!r} has no wiki document")
+            raise DataJoinError(
+                f"sentence {sentence_by_document[key]!r} has no wiki document"
+            )
         document_ordinals[key] = ordinal
 
     document_rows = documents.read_many(document_ordinals.values())
-    link_ordinals: dict[tuple[str, str], list[int]] = {}
+    link_lookup_keys: dict[JoinKey, tuple[str, str]] = {
+        (_WIKI_LINK_OCCURRENCE, *key): key for key in document_ordinals
+    }
+    link_ordinals: dict[tuple[str, str], list[int]] = {
+        key: [] for key in document_ordinals
+    }
+    for indexed_key, ordinal in index.iter_row_occurrences_for_keys(
+        link_lookup_keys, max_unique_keys=len(labels)
+    ):
+        link_ordinals[link_lookup_keys[indexed_key]].append(ordinal)
+
     link_rows: dict[tuple[str, str], list[Row]] = {}
     polygon_ordinals: dict[str, int] = {}
+    polygon_lookup_keys: dict[JoinKey, str] = {}
     for key in document_ordinals:
-        ordinals = list(index.iter_row_indices((_WIKI_LINK_OCCURRENCE, *key)))
+        ordinals = link_ordinals[key]
         rows = links.read_many(ordinals)
-        link_ordinals[key] = ordinals
         link_rows[key] = rows
         for link in rows:
             polygon_id = _identifier(link, "polygon_id", "polygon_link")
-            polygon_ordinal = index.lookup_unique((_WIKI_POLYGON_ID, polygon_id))
-            if polygon_ordinal is None:
-                raise DataJoinError(f"wiki link names missing polygon {polygon_id!r}")
-            polygon_ordinals[polygon_id] = polygon_ordinal
+            polygon_lookup_keys.setdefault((_WIKI_POLYGON_ID, polygon_id), polygon_id)
+
+    polygon_lookups = index.iter_lookup_unique(polygon_lookup_keys)
+    for indexed_key, ordinal in polygon_lookups:
+        polygon_id = polygon_lookup_keys[indexed_key]
+        if ordinal is None:
+            raise DataJoinError(f"wiki link names missing polygon {polygon_id!r}")
+        polygon_ordinals[polygon_id] = ordinal
 
     polygon_rows = polygons.read_many(sorted(polygon_ordinals.values()))
     joined = joined_outputs.join_wiki_partition(
