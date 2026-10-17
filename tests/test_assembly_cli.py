@@ -365,6 +365,69 @@ def test_global_cli_resumes_by_verifying_existing_partition_manifests(
     assert (output_dir / "assembly-plan.json").read_bytes() == first_plan
 
 
+def test_global_cli_resumes_with_remaining_output_budget_after_partial_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source()
+    files = _two_partition_files()
+    monkeypatch.setattr(assembly_cli, "SOURCE_CATALOG", (source,))
+    monkeypatch.setattr(
+        assembly_cli, "fetch_pinned_files", lambda *_args, **_kwargs: files
+    )
+    plan = assembly_cli.build_assembly_plan((source,), files)
+    budget = assembly_cli.estimate_storage_budget(plan)
+    monkeypatch.setattr(
+        assembly_cli.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=10**12),
+    )
+    calls: list[str] = []
+
+    def runner(
+        argv: list[str],
+        *,
+        opener: Any = None,
+        progress_callback: Any = None,
+    ) -> int:
+        labels_path = argv[argv.index("--labels") + 1]
+        calls.append(labels_path)
+        output_dir = Path(argv[argv.index("--output-dir") + 1])
+        manifest_path = joined_manifest_path(output_dir, "fixture", labels_path)
+        if not manifest_path.exists():
+            _write_partition_manifest(
+                output_dir,
+                labels_path=labels_path,
+                status_counts=_partition_status_counts(labels_path),
+            )
+        return 0
+
+    monkeypatch.setattr(assembly_cli, "run_joined_partition", runner)
+    output_dir = tmp_path / "assembly"
+    args = ["--output-dir", str(output_dir), "--max-new-partitions", "1"]
+
+    assert assembly_cli.main(args) == assembly_cli.EXIT_PAUSED
+    paused = json.loads((output_dir / "assembly-progress.json").read_text())
+    assert paused["partitions_completed"] == 1
+    assert paused["unique_output_bytes"] == 50
+
+    monkeypatch.setattr(
+        assembly_cli.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=budget.required_free_bytes - 1),
+    )
+
+    assert assembly_cli.main(args) == assembly_cli.EXIT_OK
+    complete = json.loads((output_dir / "assembly-progress.json").read_text())
+    assert complete["partitions_completed"] == 2
+    assert complete["unique_output_bytes"] == 100
+    assert calls == [
+        "labels/data/a.parquet",
+        "labels/data/a.parquet",
+        "labels/data/b.parquet",
+    ]
+
+
 def test_cli_pauses_after_a_bounded_number_of_new_partitions_and_resumes_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -970,6 +1033,35 @@ def test_source_tree_identity_supports_installed_package_layout(
     (package / "atlas_domain" / "module.py").write_text("VALUE = 2\n")
 
     assert len(source_tree_sha256(package)) == 64
+
+
+def test_implementation_revision_falls_back_to_installed_source_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "site-packages"
+    module = package / "atlas_io" / "assembly_cli.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("VALUE = 1\n")
+    (package / "atlas_domain").mkdir()
+    (package / "atlas_domain" / "module.py").write_text("VALUE = 2\n")
+    monkeypatch.setattr(assembly_cli, "__file__", str(module))
+
+    def no_git_repository(
+        *_args: Any, **_kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=["git"],
+            returncode=128,
+            stdout="",
+            stderr="not a git repository",
+        )
+
+    monkeypatch.setattr(assembly_cli.subprocess, "run", no_git_repository)
+    expected = assembly_cli._source_tree_sha256(package)
+
+    assert assembly_cli._implementation_revision() == f"source-tree-sha256:{expected}"
+    assert assembly_cli._implementation_revision() == f"source-tree-sha256:{expected}"
 
 
 def test_dry_run_reports_source_identity_read_error_cleanly(
