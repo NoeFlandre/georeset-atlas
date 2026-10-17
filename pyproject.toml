@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlas-domain-slice"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["h3>=4.0,<5.0", "pyarrow>=22.0", "shapely>=2.0,<3.0"]
+
+[project.scripts]
+atlas-join = "atlas_io.joined_cli:main"
+atlas-assemble = "atlas_io.assembly_cli:main"
+atlas-shard = "atlas_io.shard_cli:main"
+atlas-h3 = "atlas_h3.cli:main"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.0",
+    "pytest>=8.0",
+    "pytest-bdd>=8,<9",
+    "ruff>=0.11",
+    "ty>=0.0.78,<0.1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+atlas_domain = ["language-crosswalk-1.0.0.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ty.environment]
+python-version = "3.12"

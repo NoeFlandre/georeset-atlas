@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: '0.11.16'
+          enable-cache: false
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups --no-install-project
+      - name: Check locked dependency set
+        run: uv lock --check
+      - name: Lint
+        run: uv run --locked --no-sync ruff check --no-cache src tests tools
+      - name: Check formatting
+        run: uv run --locked --no-sync ruff format --check src tests tools
+      - name: Check types
+        run: uv run --locked --no-sync ty check src tests tools
+      - name: Run tests
+        run: uv run --locked --no-sync pytest -q
+      - name: Smoke-test CLI help
+        run: |
+          PYTHONPATH=src uv run --locked --no-sync python -m atlas_io.shard_cli --help
+          PYTHONPATH=src uv run --locked --no-sync python -m atlas_io.assembly_cli --help

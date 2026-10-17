@@ -1,0 +1,111 @@
+# Data schema
+
+**Status: NOT RELEASE-READY.** This page is a draft. Table names come from the source catalog. Column lists are pending.
+
+## Logical source tables
+
+A logical table groups one or more table roots. Each table root is a relative path inside one pinned source.
+
+| Source ID | Logical table | Table roots |
+| --- | --- | --- |
+| `description` | `polygons` | `data` |
+| `description` | `text_units` | `language-v1/data` |
+| `description` | `labels` | `labels/language-v1/data` |
+| `website` | `polygons_and_text` | `polygons` |
+| `website` | `labels` | `labels/polygons` |
+| `wiki` | `polygons` | `polygons` |
+| `wiki` | `text_units` | `wikipedia/sentences`, `wikivoyage/sentences` |
+| `wiki` | `documents` | `wikipedia/documents`, `wikivoyage/documents` |
+| `wiki` | `polygon_document_links` | `polygon_document_links` |
+| `wiki` | `labels` | `labels/wikipedia/sentences`, `labels/wikivoyage/sentences` |
+
+## Target tables
+
+The planned Atlas output uses these target tables. Exact column lists are pending.
+
+- `polygon_records`: stores polygons once. Source geometry forms differ. Description geometry is well-known binary (WKB) in GeoParquet 1.1, with CRS84. Website and Wiki geometry are GeoJSON strings. Source precision and provenance are preserved.
+- `documents`: stores source documents.
+- `text_units`: stores original text occurrences.
+- `polygon_document_links`: stores occurrence associations between polygons and documents.
+- `labels`: stores each source label row, including conflicts and failures or skips.
+- Generation audit records: store frozen inputs, tool and config versions, row and status reconciliation, output hashes, and run measurements.
+
+## Target configs
+
+The configs below are intended. Implementation is pending.
+
+- The default relevant view selects one original text unit labeled `yes`. It includes a `polygon_ids` list, the exact text, the source, the unified public language, IDs, the source URL, and provenance.
+- The `all_labeled` view exposes `yes` and `no` labels, plus `failed` and `skipped` labels.
+- Source-specific configs, the polygon companion, and the generation audit views share native Parquet shards partitioned by source and status. They do not copy the full data.
+
+## License and attribution metadata
+
+The output combines components with different source terms. Do not assign one license to the complete Atlas. The Wiki document `license` and `attribution` fields and Website `source_url` fields remain tied to their source components. The Website source card says its text is not covered by ODbL; see [Licensing and attribution](licensing-and-attribution.md) and the repository-root `component-rights.json`. The Wiki document fields still require a full-export readback check.
+
+## Planned storage and preservation
+
+- Outputs are Parquet files (a columnar file format), partitioned by source and status.
+- Shared shards are stored once and referenced through configs. They are not copied into each partition.
+- Occurrence duplicates are preserved, along with the conflicts between them.
+- Original text is preserved.
+- Geometry precision and provenance are preserved.
+- Label status is preserved.
+
+## Join keys
+
+These join keys come from the approved contract.
+
+- `source_id` and the pinned revision identify a source.
+
+### Description
+
+- Label-to-text joins use `description_identity`, `tag_key`, and `sentence_index`. `sentence_index` selects the entry in the original `sentences` array.
+- Unsplit cases, with status `unsupported_language` or `not_detected`, use `original_text`. Their skipped label uses index 0.
+- The identity then maps to polygons by `source_pbf`, `osm_type`, and `osm_id`.
+- `osm_type` and `osm_id` form an entity key only. They do not authorize merging entities from different source snapshots.
+
+### Website
+
+- Label-to-text joins use `polygon_id`, `field`, and `sentence_index`. The join selects `website_sentences` or `contact_website_sentences`.
+- Native statuses are field-specific. `unsupported_language` can have a null sentence array. Its skipped unit uses the full original field text.
+- The full Website text is retained, because concatenating split sentences is lossy.
+
+### Wiki
+
+- The label `sentence_id` joins to the sentence row.
+- The sentence `document_id` and `project` join to the document.
+- `polygon_document_links` associate polygons and documents by `document_id`, `project`, and `polygon_id`. The association is many-to-many.
+- The links table stores occurrences. Duplicate link occurrences and source order are preserved.
+- Wiki labels cover Wikipedia and Wikivoyage sentences, not Wikidata facts.
+
+The audit records these field names: `sentence_index`, `split_status`, `original_text`, and `sentences`. Exact column lists are pending.
+
+## Known limitations
+
+1. Some pinned Description text rows have empty `sentences` arrays. These rows still have `original_text`. Their skipped labels still point to index 0.
+2. In the Afghanistan Description pilot, 31 of 215 labels have `split_status` `unsupported_language`. All 31 use index 0.
+3. A joined row keeps its raw split status. The status `unsupported_language` is treated as unsplit.
+4. The native Website polygon schema has field-specific statuses. It has no generic `decision` column.
+5. Wiki output manifests reference content-addressed `polygon_document_links` shards. Identical Parquet bytes share one physical shard across Wikipedia and Wikivoyage; distinct contents use distinct shards. Regression tests cover this writer behavior, but global link-shard reconciliation has not run.
+6. Wiki viewer language codes do not match the Wiki language-split directories. See [Methods](methods.md).
+7. Pilot joins cover Afghanistan only. They are not full-source results.
+
+## Bounded assembly command
+
+The global builder first inventories the frozen Hub tree metadata and checks that the output volume has the planned reserve. It then reads one labels partition at a time with strict HTTP Range requests and writes a hash-verified partition manifest. A rerun verifies committed partitions and resumes at the first unfinished partition. After an interrupted write, it reuses an orphan output only when rebuilding the same frozen partition produces the same hash.
+
+```sh
+atlas-assemble --output-dir /path/on/a/large/local/volume/atlas-v0 --dry-run
+atlas-assemble --output-dir /path/on/a/large/local/volume/atlas-v0 --max-bytes 2500000000
+atlas-assemble --output-dir /path/on/a/large/local/volume/atlas-v0 --max-new-partitions 25
+```
+
+The dry run makes metadata requests only; it does not read Parquet rows or create the output directory. The builder stops before starting another partition if the live free-space reserve is no longer met. It writes `assembly-plan.json`, atomically checkpoints `assembly-progress.json` after each completed partition, and writes `assembly-manifest.json` only after exact source status reconciliation.
+
+`--max-new-partitions` is an optional deterministic pause point. It returns exit code 7 and records the next partition in `assembly-progress.json` after the requested number of partitions without an existing manifest complete. On resume, existing manifests are verified and counted once; they do not consume the new-partition limit. A graceful Ctrl-C during a partition records that partition as pending and returns exit code 7. An abrupt process or machine stop can leave progress at the last atomic checkpoint: a partition with a committed manifest is verified on resume, while an unfinished partition is retried. Its orphan outputs are reused only if the rebuilt contents have matching hashes; otherwise the join refuses to overwrite them. Input datasets are read-only throughout.
+
+New assembly plans also record a separately checksummed execution identity: the pinned input-plan digest, a digest of the source tree and dependency lock, Python and platform details, the CPU device, PyArrow and SQLite versions, storage limit, batching parameters, and Parquet compression. The historical label-generation model is recorded as unknown because its exact identity is not evidenced in the available provenance; Atlas assembly does not run model inference. The ordinary `plan_sha256` continues to cover the original plan body.
+
+Older checkpoints do not contain this execution identity. To resume one, pass `--allow-legacy-checkpoint` explicitly. The builder first checks the old plan checksum, pinned input inventory, schema, and storage plan. It then records the old plan digest, notes that the prior code/runtime/device/batching identity is unavailable, and stores the current identity without changing the original `plan_sha256`. Later resumes require that stored identity to match.
+
+The plan hash includes the implementation revision. A resume may use a different Git revision only when the separately stored execution identity and all other plan fields match exactly; a source-code change changes that identity and requires a new output directory. Preserve earlier runs.
