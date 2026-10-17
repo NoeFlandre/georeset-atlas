@@ -713,6 +713,42 @@ def _write_complete_assembly(
     return root
 
 
+def test_verified_assembly_plan_digest_ignores_current_metadata(
+    tmp_path: Path,
+) -> None:
+    from atlas_h3._assembly import load_verified_assembly
+
+    root = _write_complete_assembly(tmp_path / "assembly-current-plan")
+    plan_path = root / "assembly-plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan_body = {key: value for key, value in plan.items() if key != "plan_sha256"}
+    plan_body.update(
+        execution_identity={"identity_version": 1, "source_tree_sha256": "b" * 64},
+        execution_identity_sha256="c" * 64,
+        legacy_checkpoint={"prior_plan_sha256": "d" * 64},
+    )
+    metadata = {
+        "plan_sha256",
+        "execution_identity",
+        "execution_identity_sha256",
+        "legacy_checkpoint",
+    }
+    digest_body = {
+        key: value for key, value in plan_body.items() if key not in metadata
+    }
+    plan_sha256 = hashlib.sha256(_canonical_json(digest_body) + b"\n").hexdigest()
+    plan_path.write_bytes(_json_bytes({**plan_body, "plan_sha256": plan_sha256}))
+    for name in ("assembly-progress.json", "assembly-manifest.json"):
+        path = root / name
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["plan_sha256"] = plan_sha256
+        path.write_bytes(_json_bytes(document))
+
+    assembly = load_verified_assembly(root)
+
+    assert assembly.plan_sha256 == plan_sha256
+
+
 def _alpha_spec(
     yes_polygon_ids: list[str],
     extra_labels: list[dict[str, Any]] | None = None,
