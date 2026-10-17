@@ -1,0 +1,56 @@
+{
+  "candidate_source_sha256": {
+    "src/atlas_io/disk_join_index.py": "bb10d68d9bd9ebb49fcfd3a403858417a198cd6090daf2a907a188b861a21992",
+    "src/atlas_io/disk_joined.py": "726cb587a3dc57ae1396d56ec019c81e91b76a594180d5a07c89fe42ce643646",
+    "tests/test_disk_join_index.py": "6ac2a27016a50874257c3f1e8f4726a6d15f635546d3c47159d21b0b447b5248"
+  },
+  "candidate_worktree_head": "e2c8567ad585ea94242bc61ad5f172300b5bdf6d",
+  "database": "SQLite :memory:, populated once from the real Wiki sentence IDs",
+  "input": "build/atlas-v0-full-e2c8567-20261015/wiki__labels-wikipedia-sentences-alsace-latest.text_units.parquet",
+  "input_rows": 50000,
+  "input_sha256": "c1d6603264b9f04d171f402b2bd3b03d3d2f82ff2c8ef49bca45157d19386ff4",
+  "measurement_scope": "unique_rows lookup API only; excludes Parquet loading, index construction, staging, full join, output serialization, and HDD latency",
+  "order": "five alternating paired runs; each side warmed once before timing",
+  "query_counts": {
+    "baseline_single_lookup_unique": 50000,
+    "candidate_iter_lookup_unique": 391
+  },
+  "result_ordered_key_ordinal_sha256": "a888b3bf560ccf23fc9c2c4481b4533e686c7e2f66c69e43c12f7fbf16d33cad",
+  "run_date_utc": "2026-10-17",
+  "runs": [
+    {"pair": 1, "side": "batch", "wall_ms": 185.393875, "cpu_ms": 185.395},
+    {"pair": 1, "side": "single", "wall_ms": 213.793083, "cpu_ms": 213.771},
+    {"pair": 2, "side": "single", "wall_ms": 213.449166, "cpu_ms": 213.167},
+    {"pair": 2, "side": "batch", "wall_ms": 188.793917, "cpu_ms": 188.794},
+    {"pair": 3, "side": "batch", "wall_ms": 186.945583, "cpu_ms": 186.929},
+    {"pair": 3, "side": "single", "wall_ms": 220.502083, "cpu_ms": 220.502},
+    {"pair": 4, "side": "single", "wall_ms": 220.179333, "cpu_ms": 220.161},
+    {"pair": 4, "side": "batch", "wall_ms": 190.2245, "cpu_ms": 190.225},
+    {"pair": 5, "side": "batch", "wall_ms": 199.459875, "cpu_ms": 198.414},
+    {"pair": 5, "side": "single", "wall_ms": 221.438666, "cpu_ms": 221.412}
+  ],
+  "summary": {
+    "baseline_single": {
+      "median_wall_ms": 220.179333,
+      "wall_range_ms": [213.449166, 221.438666],
+      "throughput_rows_per_second": 227087.617
+    },
+    "candidate_batch": {
+      "median_wall_ms": 188.793917,
+      "wall_range_ms": [185.393875, 199.459875],
+      "throughput_rows_per_second": 264839.041
+    },
+    "throughput_ratio": 1.166242,
+    "latency_reduction": 0.142545
+  },
+  "tests": {
+    "full_suite_default_sandbox": "535 passed; one loopback-bind test was denied by the sandbox",
+    "loopback_test_with_local_bind_permission": "1 passed",
+    "full_suite_combined": "all 536 tests passed across the two runs; 16 pytest-bdd deprecation warnings",
+    "focused_join_manifest_resume": "78 passed in 11.04s",
+    "streaming_output_schema": "9 passed in 3.27s",
+    "ruff_check": "passed",
+    "ruff_format_check": "passed",
+    "ty_changed_modules": "passed"
+  }
+}

@@ -1,8 +1,11 @@
+import heapq
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from itertools import islice
 from pathlib import Path
 
 _MAX_ROW_ORDINAL = 2**63 - 1
+_MAX_KEYS_PER_QUERY = 128
 
 type JoinKey = int | str | tuple[JoinKey, ...]
 
@@ -40,6 +43,13 @@ def _row_ordinal(value: int) -> int:
     return value
 
 
+def _occurrence_rows(
+    cursor: sqlite3.Cursor,
+) -> Iterator[tuple[int, bytes, int]]:
+    for sequence, encoded_key, row_ordinal in cursor:
+        yield int(sequence), bytes(encoded_key), int(row_ordinal)
+
+
 class _SQLiteFile:
     def __init__(self, path: str | Path) -> None:
         self._connection = sqlite3.connect(path)
@@ -67,15 +77,21 @@ class DiskJoinIndex(_SQLiteFile):
             "(sequence INTEGER PRIMARY KEY, key BLOB NOT NULL, "
             "row_ordinal INTEGER NOT NULL CHECK(row_ordinal >= 0))"
         )
-        self._connection.execute(
-            "CREATE INDEX IF NOT EXISTS row_occurrences_key_sequence "
-            "ON row_occurrences(key, sequence)"
-        )
+        self._occurrence_index_ready = False
         self._connection.execute(
             "CREATE TABLE IF NOT EXISTS unique_rows "
             "(key BLOB PRIMARY KEY, row_ordinal INTEGER NOT NULL "
             "CHECK(row_ordinal >= 0))"
         )
+
+    def _ensure_occurrence_index(self) -> None:
+        if self._occurrence_index_ready:
+            return
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS row_occurrences_key_sequence "
+            "ON row_occurrences(key, sequence)"
+        )
+        self._occurrence_index_ready = True
 
     def add(self, key: JoinKey, row_ordinal: int) -> None:
         self._ensure_open()
@@ -86,11 +102,63 @@ class DiskJoinIndex(_SQLiteFile):
 
     def iter_row_indices(self, key: JoinKey) -> Iterator[int]:
         self._ensure_open()
+        self._ensure_occurrence_index()
         cursor = self._connection.execute(
             "SELECT row_ordinal FROM row_occurrences WHERE key = ? ORDER BY sequence",
             (_canonical_key(key),),
         )
         return (int(row[0]) for row in cursor)
+
+    def iter_lookup_unique(
+        self, keys: Iterable[JoinKey]
+    ) -> Iterator[tuple[JoinKey, int | None]]:
+        self._ensure_open()
+        requested_keys = iter(keys)
+        while batch := list(islice(requested_keys, _MAX_KEYS_PER_QUERY)):
+            encoded_keys = [_canonical_key(key) for key in batch]
+            unique_encoded_keys = list(dict.fromkeys(encoded_keys))
+            placeholders = ", ".join("?" for _ in unique_encoded_keys)
+            cursor = self._connection.execute(
+                "SELECT key, row_ordinal FROM unique_rows "
+                f"WHERE key IN ({placeholders})",
+                unique_encoded_keys,
+            )
+            row_ordinals = {bytes(row[0]): int(row[1]) for row in cursor}
+            yield from (
+                (key, row_ordinals.get(encoded_key))
+                for key, encoded_key in zip(batch, encoded_keys, strict=True)
+            )
+
+    def iter_row_occurrences_for_keys(
+        self, keys: Iterable[JoinKey], *, max_unique_keys: int
+    ) -> Iterator[tuple[JoinKey, int]]:
+        self._ensure_open()
+        if type(max_unique_keys) is not int or max_unique_keys < 0:
+            raise ValueError("max_unique_keys must be a non-negative integer")
+        key_by_encoded: dict[bytes, JoinKey] = {}
+        for key in keys:
+            encoded_key = _canonical_key(key)
+            if encoded_key in key_by_encoded:
+                continue
+            if len(key_by_encoded) >= max_unique_keys:
+                raise ValueError("number of distinct join keys exceeds max_unique_keys")
+            key_by_encoded[encoded_key] = key
+        if not key_by_encoded:
+            return
+        self._ensure_occurrence_index()
+        encoded_keys = list(key_by_encoded)
+        streams: list[Iterator[tuple[int, bytes, int]]] = []
+        for start in range(0, len(encoded_keys), _MAX_KEYS_PER_QUERY):
+            batch = encoded_keys[start : start + _MAX_KEYS_PER_QUERY]
+            placeholders = ", ".join("?" for _ in batch)
+            cursor = self._connection.execute(
+                "SELECT sequence, key, row_ordinal FROM row_occurrences "
+                f"WHERE key IN ({placeholders}) ORDER BY sequence",
+                batch,
+            )
+            streams.append(_occurrence_rows(cursor))
+        for _, encoded_key, row_ordinal in heapq.merge(*streams):
+            yield key_by_encoded[encoded_key], row_ordinal
 
     def add_unique(self, key: JoinKey, row_ordinal: int) -> None:
         self._ensure_open()
