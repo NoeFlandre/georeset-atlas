@@ -807,7 +807,12 @@ def test_execution_identity_change_rejects_resume_even_with_legacy_flag(
         assembly_cli, "fetch_pinned_files", lambda *_args, **_kwargs: _files()
     )
 
-    def runner(argv: list[str], *, opener: Any = None) -> int:
+    def runner(
+        argv: list[str],
+        *,
+        opener: Any = None,
+        progress_callback: Any = None,
+    ) -> int:
         _write_manifest(
             Path(argv[argv.index("--output-dir") + 1]),
             status_counts={"yes": 1, "no": 1, "failed": 1, "skipped": 1},
@@ -888,7 +893,12 @@ def test_legacy_completed_manifest_migrates_only_with_explicit_flag(
         assembly_cli, "fetch_pinned_files", lambda *_args, **_kwargs: files
     )
 
-    def runner(argv: list[str], *, opener: Any = None) -> int:
+    def runner(
+        argv: list[str],
+        *,
+        opener: Any = None,
+        progress_callback: Any = None,
+    ) -> int:
         _write_manifest(
             Path(argv[argv.index("--output-dir") + 1]),
             status_counts={"yes": 1, "no": 1, "failed": 1, "skipped": 1},

@@ -778,7 +778,7 @@ def main(
         except KeyboardInterrupt:
             heartbeat_stop.set()
             heartbeat_thread.join()
-            heartbeat_write("paused", "join")
+            heartbeat_write("paused", "join", None)
             payload = _progress_payload(
                 plan_document=plan_doc,
                 status="paused",
@@ -907,7 +907,7 @@ def main(
                 error="paused at the requested new-partition limit",
                 pending_partition=next_partition.labels_path,
             )
-            heartbeat_write("paused", "checkpoint")
+            heartbeat_write("paused", "checkpoint", None)
             _write_json_atomic(
                 args.output_dir / _PROGRESS_FILE, _canonical_json(paused)
             )
