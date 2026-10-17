@@ -38,6 +38,161 @@ def test_package_exposes_build_maps() -> None:
     assert callable(getattr(module, "build_maps", None))
 
 
+@pytest.mark.parametrize(
+    ("source_id", "fields", "values", "expected"),
+    [
+        (
+            "description",
+            ("description_identity", "tag_key", "sentence_index"),
+            ("way/1", "name", 2),
+            '["way/1","name",2]',
+        ),
+        (
+            "website",
+            ("polygon_id", "field", "sentence_index"),
+            ("way/1", "contact_website", 1),
+            '["way/1","contact_website",1]',
+        ),
+        ("wiki", ("sentence_id",), ("enwiki:42",), "enwiki:42"),
+    ],
+)
+def test_h3_reconstructs_native_occurrence_keys(
+    source_id: str,
+    fields: tuple[str, ...],
+    values: tuple[str | int, ...],
+    expected: str,
+) -> None:
+    from atlas_h3._aggregate import (
+        _text_unit_key_columns,
+        _text_unit_key_from_values,
+    )
+
+    assert _text_unit_key_columns(source_id, list(fields)) == fields
+    assert _text_unit_key_from_values(source_id, fields, values) == expected
+
+
+def test_disk_joined_description_output_feeds_h3_and_keeps_language_provenance(
+    tmp_path: Path,
+) -> None:
+    from atlas_domain.source_catalog import SOURCE_CATALOG
+    from atlas_h3._aggregate import aggregate_maps
+    from atlas_h3._assembly import PartitionInput, VerifiedAssembly
+    from atlas_io.disk_joined import build_description_partition
+    from atlas_io.joined_partitions import stage_table_groups, write_joined_partition
+
+    source = next(item for item in SOURCE_CATALOG if item.source_id == "description")
+    label_path = f"{source.table_roots['labels'][0]}/region-a.parquet"
+    labels = stage_table_groups(
+        [
+            pa.Table.from_pylist(
+                [
+                    {
+                        "description_identity": "way/1",
+                        "tag_key": "name",
+                        "sentence_index": 0,
+                        "decision": "yes",
+                    }
+                ]
+            )
+        ],
+        tmp_path / "labels.parquet",
+    )
+    text_units = stage_table_groups(
+        [
+            pa.Table.from_pylist(
+                [
+                    {
+                        "description_identity": "way/1",
+                        "tag_key": "name",
+                        "source_pbf": "region.osm.pbf",
+                        "osm_type": "way",
+                        "osm_id": "1",
+                        "split_status": "split",
+                        "original_text": "A mapped place.",
+                        "sentences": ["A mapped place."],
+                        "source_url": "https://example.test/way/1",
+                        "raw_language_code": "eng",
+                        "reason": "detected",
+                    }
+                ]
+            )
+        ],
+        tmp_path / "text-units.parquet",
+    )
+    polygons = stage_table_groups(
+        [
+            pa.Table.from_pylist(
+                [
+                    {
+                        "polygon_id": "way/1",
+                        "source_pbf": "region.osm.pbf",
+                        "osm_type": "way",
+                        "osm_id": "1",
+                        "geometry_wkb": _rectangle_wkb(-0.1, -0.1, 0.1, 0.1),
+                    }
+                ]
+            )
+        ],
+        tmp_path / "polygons.parquet",
+    )
+    output_dir = tmp_path / "joined"
+    output_dir.mkdir()
+    result = write_joined_partition(
+        source_id=source.source_id,
+        repo_id=source.repo_id,
+        revision=source.revision,
+        path=label_path,
+        output_dir=output_dir,
+        build=lambda: build_description_partition(
+            labels=labels,
+            text_units=text_units,
+            polygons=polygons,
+            workspace_path=tmp_path / "description.sqlite",
+        ),
+    )
+    output_paths = {
+        table: output_dir / item["name"]
+        for table, item in result.manifest["outputs"].items()
+    }
+    joined_labels = pq.read_table(output_paths["labels"])
+    joined_text_units = pq.read_table(output_paths["text_units"])
+
+    assert "text_unit_key" not in joined_labels.schema.names
+    assert "text_unit_key" not in joined_text_units.schema.names
+    assert joined_text_units.schema.field("language_scheme").type == pa.string()
+    assert (
+        joined_text_units.schema.field("language_mapping_version").type == pa.string()
+    )
+    text_unit = joined_text_units.to_pylist()[0]
+    assert text_unit["language_code"] == "en"
+    assert text_unit["raw_language_code"] == "eng"
+    assert text_unit["language_scheme"] == "lingua_iso639_3"
+    assert text_unit["language_mapping_version"] == "atlas-language-crosswalk-1.0.0"
+    assert text_unit["language_script"] is None
+    assert text_unit["language_mapping_status"] == "resolved"
+
+    partition = PartitionInput(
+        source_id=source.source_id,
+        labels_path=label_path,
+        manifest_path=result.manifest_path,
+        tables=output_paths,
+    )
+    status_counts = {"yes": 1, "no": 0, "failed": 0, "skipped": 0}
+    assembly = VerifiedAssembly(
+        root=tmp_path,
+        partitions=(partition,),
+        source_ids=(source.source_id,),
+        status_counts={source.source_id: status_counts},
+        plan_sha256="a" * 64,
+        implementation_revision="b" * 40,
+    )
+
+    aggregate = aggregate_maps(assembly, tmp_path / "atlas-h3.sqlite3")
+
+    assert aggregate.rows_by_view["description"][0]["distinct_text_units"] == 1
+    assert aggregate.rows_by_view["description"][0]["yes_label_count"] == 1
+
+
 def test_build_maps_aggregates_duplicate_associations_and_all_statuses(
     tmp_path: Path,
 ) -> None:

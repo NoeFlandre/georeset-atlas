@@ -14,6 +14,11 @@ import pyarrow.parquet as pq
 from shapely import from_wkb
 from shapely.geometry import MultiPolygon, Polygon, shape
 
+from atlas_domain.occurrences import (
+    description_occurrence_key,
+    website_occurrence_key,
+    wiki_sentence_key,
+)
 from atlas_h3._assembly import STATUSES, PartitionInput, VerifiedAssembly
 from atlas_h3._errors import AtlasH3InputError
 
@@ -42,6 +47,11 @@ _QUALITY_FIELDS = (
     "invalid_geometry_association_occurrences",
     "unmatched_polygon_association_occurrences",
 )
+_NATIVE_KEY_FIELDS = {
+    "description": ("description_identity", "tag_key", "sentence_index"),
+    "website": ("polygon_id", "field", "sentence_index"),
+    "wiki": ("sentence_id",),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,13 +237,19 @@ def _load_labels(
     label_id = 0
     for partition in partitions:
         parquet_file = pq.ParquetFile(partition.tables["labels"])
-        for batch in _iter_batches(parquet_file, ("text_unit_key", "status")):
-            unit_keys = batch.column(0)
-            statuses = batch.column(1)
+        key_fields = _text_unit_key_columns(source_id, parquet_file.schema_arrow.names)
+        columns = (*key_fields, "status")
+        for batch in _iter_batches(parquet_file, columns):
+            statuses = batch.column(len(key_fields))
             batch_rows: list[tuple[str, int, str, str]] = []
             for row_index in range(batch.num_rows):
-                unit_key = _required_string(
-                    unit_keys[row_index].as_py(), "text_unit_key"
+                unit_key = _text_unit_key_from_values(
+                    source_id,
+                    key_fields,
+                    tuple(
+                        batch.column(index)[row_index].as_py()
+                        for index in range(len(key_fields))
+                    ),
                 )
                 status = statuses[row_index].as_py()
                 if status not in STATUSES:
@@ -248,6 +264,63 @@ def _load_labels(
                     "INSERT INTO labels VALUES (?, ?, ?, ?)", batch_rows
                 )
     return counts
+
+
+def _text_unit_key_columns(source_id: str, available: list[str]) -> tuple[str, ...]:
+    if "text_unit_key" in available:
+        return ("text_unit_key",)
+    fields = _NATIVE_KEY_FIELDS.get(source_id)
+    if fields is None:
+        raise AtlasH3InputError(
+            f"source {source_id} has no text_unit_key or supported native identity"
+        )
+    missing = sorted(set(fields) - set(available))
+    if missing:
+        raise AtlasH3InputError(
+            f"source {source_id} is missing native identity fields {missing}"
+        )
+    return fields
+
+
+def _text_unit_key_from_values(
+    source_id: str, fields: tuple[str, ...], values: tuple[Any, ...]
+) -> str:
+    if fields == ("text_unit_key",):
+        return _required_string(values[0], "text_unit_key")
+    try:
+        if source_id == "description":
+            key = description_occurrence_key(
+                _required_string(values[0], "description_identity"),
+                _required_string(values[1], "tag_key"),
+                _required_sentence_index(values[2]),
+            )
+        elif source_id == "website":
+            key = website_occurrence_key(
+                _required_string(values[0], "polygon_id"),
+                _required_string(values[1], "field"),
+                _required_sentence_index(values[2]),
+            )
+        elif source_id == "wiki":
+            key = wiki_sentence_key(_required_string(values[0], "sentence_id"))
+        else:
+            raise AtlasH3InputError(
+                f"source {source_id} has no supported native text-unit identity"
+            )
+    except ValueError as error:
+        raise AtlasH3InputError(
+            f"source {source_id} has malformed native text-unit identity"
+        ) from error
+    if isinstance(key, str):
+        return key
+    return json.dumps(key, ensure_ascii=False, separators=(",", ":"))
+
+
+def _required_sentence_index(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise AtlasH3InputError(
+            "assembly field sentence_index must be a non-negative integer"
+        )
+    return value
 
 
 def _load_polygon_locations(
@@ -354,12 +427,18 @@ def _load_associations(
     association_batch: list[tuple[str, int, str, str]] = []
     for partition in partitions:
         parquet_file = pq.ParquetFile(partition.tables["text_units"])
-        for batch in _iter_batches(parquet_file, ("text_unit_key", "polygon_ids")):
-            unit_keys = batch.column(0)
-            polygon_lists = batch.column(1)
+        key_fields = _text_unit_key_columns(source_id, parquet_file.schema_arrow.names)
+        columns = (*key_fields, "polygon_ids")
+        for batch in _iter_batches(parquet_file, columns):
+            polygon_lists = batch.column(len(key_fields))
             for row_index in range(batch.num_rows):
-                unit_key = _required_string(
-                    unit_keys[row_index].as_py(), "text_unit_key"
+                unit_key = _text_unit_key_from_values(
+                    source_id,
+                    key_fields,
+                    tuple(
+                        batch.column(index)[row_index].as_py()
+                        for index in range(len(key_fields))
+                    ),
                 )
                 polygon_list = polygon_lists[row_index]
                 if not polygon_list.is_valid:

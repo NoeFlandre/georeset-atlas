@@ -255,6 +255,12 @@ class _DescriptionTextUnits:
         self.output_schema = _schema_with_source(
             text_units.schema_arrow,
             {
+                "language_code": pa.string(),
+                "raw_language_code": pa.string(),
+                "language_scheme": pa.string(),
+                "language_mapping_version": pa.string(),
+                "language_script": pa.string(),
+                "language_mapping_status": pa.string(),
                 "sentence_index": pa.int64(),
                 "text": pa.string(),
                 "polygon_ids": pa.list_(pa.string()),
@@ -296,12 +302,30 @@ class _DescriptionTextUnits:
                     key = (str(record[0]), str(record[1]), int(record[2]))
                     association = description_association(text_unit, "text_unit")
                     polygon_ids = polygon_ids_by_association[association]
+                    language_field = (
+                        "language_code"
+                        if "language_code" in text_unit
+                        else "raw_language_code"
+                    )
+                    raw_language = (
+                        joined_outputs._nullable_string(
+                            text_unit, language_field, "text_unit"
+                        )
+                        if language_field in text_unit
+                        else None
+                    )
                     yield {
                         **text_unit,
                         "text_unit_key": key,
                         "sentence_index": key[2],
                         "text": description_text_for_label(label, text_unit),
                         "polygon_ids": list(polygon_ids),
+                        **joined_outputs._language_fields(
+                            raw_language,
+                            joined_outputs._DESCRIPTION_SCHEME_BY_REASON.get(
+                                text_unit.get("reason")
+                            ),
+                        ),
                     }
         finally:
             index.close()
