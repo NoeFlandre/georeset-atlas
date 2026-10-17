@@ -26,7 +26,7 @@ MANIFEST_VERSION = 1
 PARQUET_COMPRESSION = "zstd"
 OUTPUT_BATCH_ROWS = 10_000
 OUTPUT_BATCH_BYTES = 1024 * 1024
-_MAX_CACHED_ROW_GROUP_BYTES = 192 * 1024 * 1024
+_MAX_CACHED_ROW_GROUP_BYTES = 224 * 1024 * 1024
 OUTPUT_TABLES = (
     "labels",
     "text_units",
@@ -99,20 +99,59 @@ class JoinedPartitionConflictError(RuntimeError):
     pass
 
 
+def _row_group_starts(metadata: pq.FileMetaData) -> list[int]:
+    starts: list[int] = []
+    next_start = 0
+    for group in range(metadata.num_row_groups):
+        starts.append(next_start)
+        next_start += metadata.row_group(group).num_rows
+    return starts
+
+
+def _requests_by_group(
+    normalized: Sequence[int], group_starts: Sequence[int]
+) -> dict[int, list[tuple[int, int]]]:
+    requests: dict[int, list[tuple[int, int]]] = {}
+    for result_index, row_index in enumerate(normalized):
+        group = bisect_right(group_starts, row_index) - 1
+        offset = row_index - group_starts[group]
+        requests.setdefault(group, []).append((result_index, offset))
+    return requests
+
+
+def _populate_group_rows(
+    table: pa.Table,
+    group_requests: Sequence[tuple[int, int]],
+    results: list[Row],
+) -> None:
+    for start in range(0, len(group_requests), 128):
+        batch_requests = group_requests[start : start + 128]
+        offsets = pa.array([offset for _, offset in batch_requests], type=pa.int64())
+        selected_rows = table.take(offsets).to_pylist()
+        for (result_index, _), row in zip(batch_requests, selected_rows, strict=True):
+            results[result_index] = row
+
+
 class StagedRows:
     def __init__(self, path: Path) -> None:
         self._path = path
+        self._parquet_file: pq.ParquetFile | None = None
         self._row_group_cache: tuple[int, pa.Table, int] | None = None
+
+    def _reader(self) -> pq.ParquetFile:
+        if self._parquet_file is None:
+            self._parquet_file = pq.ParquetFile(self._path)
+        return self._parquet_file
 
     @property
     def schema_arrow(self) -> pa.Schema:
-        return pq.ParquetFile(self._path).schema_arrow
+        return self._reader().schema_arrow
 
     def __len__(self) -> int:
-        return pq.ParquetFile(self._path).metadata.num_rows
+        return self._reader().metadata.num_rows
 
     def __getitem__(self, index: int) -> Row:
-        parquet_file = pq.ParquetFile(self._path)
+        parquet_file = self._reader()
         metadata = parquet_file.metadata
         position = normalize_row_index(index, metadata.num_rows)
         for group in range(metadata.num_row_groups):
@@ -125,8 +164,30 @@ class StagedRows:
             f"row index {index} is out of range for {metadata.num_rows} rows"
         )
 
+    def _cached_row_group(self, group: int) -> pa.Table | None:
+        cache = self._row_group_cache
+        if cache is None:
+            return None
+        if cache[2] > _MAX_CACHED_ROW_GROUP_BYTES:
+            self._row_group_cache = None
+            return None
+        if cache[0] != group:
+            return None
+        return cache[1]
+
+    def _read_row_group(self, parquet_file: pq.ParquetFile, group: int) -> pa.Table:
+        table = self._cached_row_group(group)
+        if table is not None:
+            return table
+        self._row_group_cache = None
+        table = parquet_file.read_row_group(group)
+        table_bytes = table.get_total_buffer_size()
+        if table_bytes <= _MAX_CACHED_ROW_GROUP_BYTES:
+            self._row_group_cache = (group, table, table_bytes)
+        return table
+
     def read_many(self, indices: Iterable[int]) -> list[Row]:
-        parquet_file = pq.ParquetFile(self._path)
+        parquet_file = self._reader()
         metadata = parquet_file.metadata
         normalized = [
             normalize_row_index(index, metadata.num_rows) for index in indices
@@ -134,43 +195,17 @@ class StagedRows:
         if not normalized:
             return []
 
-        group_starts: list[int] = []
-        next_start = 0
-        for group in range(metadata.num_row_groups):
-            group_starts.append(next_start)
-            next_start += metadata.row_group(group).num_rows
-
-        requests: dict[int, list[tuple[int, int]]] = {}
-        for result_index, row_index in enumerate(normalized):
-            group = bisect_right(group_starts, row_index) - 1
-            offset = row_index - group_starts[group]
-            requests.setdefault(group, []).append((result_index, offset))
-
+        group_starts = _row_group_starts(metadata)
+        requests = _requests_by_group(normalized, group_starts)
         results: list[Row] = [{} for _ in normalized]
         for group, group_requests in sorted(requests.items()):
-            cache = self._row_group_cache
-            if cache is not None and cache[2] > _MAX_CACHED_ROW_GROUP_BYTES:
-                self._row_group_cache = None
-                cache = None
-            if cache is not None and cache[0] == group:
-                table = cache[1]
-            else:
-                self._row_group_cache = None
-                table = parquet_file.read_row_group(group)
-                table_bytes = table.get_total_buffer_size()
-                if table_bytes <= _MAX_CACHED_ROW_GROUP_BYTES:
-                    self._row_group_cache = (group, table, table_bytes)
-            for start in range(0, len(group_requests), 128):
-                chunk = group_requests[start : start + 128]
-                offsets = pa.array([offset for _, offset in chunk], type=pa.int64())
-                rows = table.take(offsets).to_pylist()
-                for (result_index, _), row in zip(chunk, rows, strict=True):
-                    results[result_index] = row
+            table = self._read_row_group(parquet_file, group)
+            _populate_group_rows(table, group_requests, results)
             del table
         return results
 
     def __iter__(self) -> Iterator[Row]:
-        parquet_file = pq.ParquetFile(self._path)
+        parquet_file = self._reader()
         for index in range(parquet_file.metadata.num_row_groups):
             yield from parquet_file.read_row_group(index).to_pylist()
 
@@ -255,6 +290,7 @@ def write_joined_partition(
         output_dir,
         prefix,
         allowed={manifest_path.name, *(output["name"] for output in outputs.values())},
+        allow_atomic_temps=resume_orphans,
     )
     manifest: dict[str, Any] = {
         **identity,
@@ -307,7 +343,12 @@ def _verify(
     }
     for table in OUTPUT_TABLES:
         _verify_output(output_dir, outputs[table], names[table])
-    _reject_orphans(output_dir, prefix, allowed={manifest_path.name, *names.values()})
+    _reject_orphans(
+        output_dir,
+        prefix,
+        allowed={manifest_path.name, *names.values()},
+        allow_atomic_temps=True,
+    )
     return JoinedPartitionResult("verified", manifest, manifest_path)
 
 
@@ -578,16 +619,34 @@ def _verify_table(path: Path, columns: Sequence[str], rows: int) -> None:
         raise OSError("temporary table does not match the rows it was built from")
 
 
-def _reject_orphans(output_dir: Path, prefix: str, *, allowed: Collection[str]) -> None:
+def _reject_orphans(
+    output_dir: Path,
+    prefix: str,
+    *,
+    allowed: Collection[str],
+    allow_atomic_temps: bool = False,
+) -> None:
     if not output_dir.is_dir():
         return
     orphans = sorted(
         entry.name
         for entry in output_dir.iterdir()
-        if _owned(entry.name, prefix) and entry.name not in allowed
+        if _owned(entry.name, prefix)
+        and entry.name not in allowed
+        and not (allow_atomic_temps and _is_atomic_temp(entry.name, prefix))
     )
     if orphans:
         raise _conflict(f"orphan outputs {orphans} have no complete manifest")
+
+
+def _is_atomic_temp(name: str, prefix: str) -> bool:
+    marker = f".{prefix}."
+    if not name.startswith(marker) or not name.endswith(".tmp"):
+        return False
+    target, separator, random_suffix = name[len(marker) : -len(".tmp")].rpartition(".")
+    atomic_targets = {f"{table}.parquet" for table in OUTPUT_TABLES}
+    atomic_targets.add("manifest.json")
+    return bool(separator and random_suffix) and target in atomic_targets
 
 
 def _owned(name: str, prefix: str) -> bool:

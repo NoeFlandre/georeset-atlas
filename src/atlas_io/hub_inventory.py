@@ -1,7 +1,11 @@
 import json
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from http.client import IncompleteRead, RemoteDisconnected
+from ssl import SSLError
 from typing import Protocol
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -30,6 +34,19 @@ class MetadataResponse(Protocol):
 
 
 MetadataOpener = Callable[..., MetadataResponse]
+InventoryProgressCallback = Callable[[str], None]
+_INVENTORY_TIMEOUT_SECONDS = 30
+_INVENTORY_MAX_ATTEMPTS = 3
+_INVENTORY_RETRY_DELAYS_SECONDS = (0.25, 1.0)
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_TRANSIENT_METADATA_ERRORS = (
+    ConnectionError,
+    IncompleteRead,
+    RemoteDisconnected,
+    SSLError,
+    TimeoutError,
+    URLError,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,31 +110,114 @@ def _tree_url(source: SourceDataset, root: str) -> str:
     )
 
 
+def _report_inventory_progress(
+    progress_callback: InventoryProgressCallback | None,
+    message: str,
+) -> None:
+    if progress_callback is not None:
+        progress_callback(message)
+
+
+def _read_tree_entries(
+    request: Request,
+    source: SourceDataset,
+    root: str,
+    opener: MetadataOpener,
+    progress_callback: InventoryProgressCallback | None,
+) -> object:
+    for attempt in range(1, _INVENTORY_MAX_ATTEMPTS + 1):
+        response: MetadataResponse | None = None
+        try:
+            response = opener(request, timeout=_INVENTORY_TIMEOUT_SECONDS)
+            status = response.status
+            if status not in {None, 200}:
+                if (
+                    status in _RETRYABLE_HTTP_STATUS_CODES
+                    and attempt < _INVENTORY_MAX_ATTEMPTS
+                ):
+                    _report_inventory_progress(
+                        progress_callback,
+                        f"inventory_retry source={source.source_id} root={root} "
+                        f"attempt={attempt}/{_INVENTORY_MAX_ATTEMPTS} http={status}",
+                    )
+                    time.sleep(_INVENTORY_RETRY_DELAYS_SECONDS[attempt - 1])
+                    continue
+                raise HubInventoryError(
+                    f"Hub tree request returned HTTP {status} for "
+                    f"{source.source_id}/{root}"
+                )
+            try:
+                return json.loads(response.read())
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                if attempt == _INVENTORY_MAX_ATTEMPTS:
+                    raise HubInventoryError(
+                        f"Hub returned invalid tree metadata for "
+                        f"{source.source_id}/{root} after {attempt} attempts"
+                    ) from error
+                _report_inventory_progress(
+                    progress_callback,
+                    f"inventory_retry source={source.source_id} root={root} "
+                    f"attempt={attempt}/{_INVENTORY_MAX_ATTEMPTS} error=invalid_json",
+                )
+                time.sleep(_INVENTORY_RETRY_DELAYS_SECONDS[attempt - 1])
+        except HTTPError as error:
+            error.close()
+            if (
+                error.code not in _RETRYABLE_HTTP_STATUS_CODES
+                or attempt == _INVENTORY_MAX_ATTEMPTS
+            ):
+                _report_inventory_progress(
+                    progress_callback,
+                    f"inventory_failed source={source.source_id} root={root} "
+                    f"attempt={attempt}/{_INVENTORY_MAX_ATTEMPTS} http={error.code}",
+                )
+                raise HubInventoryError(
+                    f"Hub tree request returned HTTP {error.code} for "
+                    f"{source.source_id}/{root} after {attempt} attempts"
+                ) from error
+            _report_inventory_progress(
+                progress_callback,
+                f"inventory_retry source={source.source_id} root={root} "
+                f"attempt={attempt}/{_INVENTORY_MAX_ATTEMPTS} http={error.code}",
+            )
+            time.sleep(_INVENTORY_RETRY_DELAYS_SECONDS[attempt - 1])
+        except _TRANSIENT_METADATA_ERRORS as error:
+            if attempt == _INVENTORY_MAX_ATTEMPTS:
+                _report_inventory_progress(
+                    progress_callback,
+                    f"inventory_failed source={source.source_id} root={root} "
+                    f"attempt={attempt}/{_INVENTORY_MAX_ATTEMPTS} "
+                    f"error={type(error).__name__}",
+                )
+                raise HubInventoryError(
+                    f"Hub tree request failed for {source.source_id}/{root} "
+                    f"after {attempt} attempts: {type(error).__name__}: {error}"
+                ) from error
+            _report_inventory_progress(
+                progress_callback,
+                f"inventory_retry source={source.source_id} root={root} "
+                f"attempt={attempt}/{_INVENTORY_MAX_ATTEMPTS} "
+                f"error={type(error).__name__}",
+            )
+            time.sleep(_INVENTORY_RETRY_DELAYS_SECONDS[attempt - 1])
+        finally:
+            if response is not None:
+                response.close()
+    raise AssertionError("inventory retry loop ended without entries or an error")
+
+
 def _list_root(
     source: SourceDataset,
     table: str,
     root: str,
     opener: MetadataOpener,
+    progress_callback: InventoryProgressCallback | None = None,
 ) -> tuple[HubParquetFile, ...]:
     request = Request(
         _tree_url(source, root),
         headers={"Accept": "application/json", "User-Agent": "georeset-atlas/0"},
     )
-    response = opener(request, timeout=30)
-    try:
-        if response.status not in {None, 200}:
-            raise HubInventoryError(
-                f"Hub tree request returned HTTP {response.status} for "
-                f"{source.source_id}/{root}"
-            )
-        try:
-            entries = json.loads(response.read())
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise HubInventoryError(
-                f"Hub returned invalid tree metadata for {source.source_id}/{root}"
-            ) from error
-    finally:
-        response.close()
+    entries = _read_tree_entries(request, source, root, opener, progress_callback)
     if not isinstance(entries, list):
         raise HubInventoryError(
             f"Hub tree metadata is not a list for {source.source_id}/{root}"
@@ -156,6 +256,7 @@ def fetch_pinned_files(
     sources: Sequence[SourceDataset],
     *,
     opener: MetadataOpener | None = None,
+    progress_callback: InventoryProgressCallback | None = None,
 ) -> tuple[HubParquetFile, ...]:
     validate_catalog(sources)
     open_metadata = opener or urlopen
@@ -163,7 +264,19 @@ def fetch_pinned_files(
     for source in sources:
         for table, roots in source.table_roots.items():
             for root in roots:
-                files.extend(_list_root(source, table, root, open_metadata))
+                _report_inventory_progress(
+                    progress_callback,
+                    f"inventory_root_start source={source.source_id} root={root}",
+                )
+                root_files = _list_root(
+                    source, table, root, open_metadata, progress_callback
+                )
+                files.extend(root_files)
+                _report_inventory_progress(
+                    progress_callback,
+                    f"inventory_root_complete source={source.source_id} "
+                    f"root={root} files={len(root_files)}",
+                )
     keys = [(file.source_id, file.table, file.path) for file in files]
     if len(keys) != len(set(keys)):
         raise HubInventoryError("the pinned inventory contains duplicate table paths")

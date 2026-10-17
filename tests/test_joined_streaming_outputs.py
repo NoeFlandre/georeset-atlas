@@ -567,12 +567,21 @@ def test_successful_join_publishes_only_the_manifest_and_outputs(
     assert all(not name.startswith(".") for name in names)
 
 
-def test_failed_join_publishes_nothing_and_leaves_no_staging(tmp_path: Path) -> None:
+def test_failed_join_publishes_nothing_and_preserves_incomplete_staging(
+    tmp_path: Path,
+) -> None:
     output_dir = tmp_path / "joined"
     hub = _hub(labels=_labels_parquet(identity="missing-description"))
 
     assert main(_argv(output_dir), opener=hub) == EXIT_JOIN_ERROR
-    assert not output_dir.exists() or not any(output_dir.iterdir())
+    assert not list(output_dir.glob("*.manifest.json"))
+    assert not list(output_dir.glob("*.parquet"))
+    (staging_dir,) = output_dir.glob(".atlas-join-staging-*")
+    assert {path.name for path in staging_dir.glob("*.parquet")} == {
+        "labels.parquet",
+        "polygons.parquet",
+        "text_units.parquet",
+    }
 
 
 def test_cli_null_only_list_elements_keep_the_exact_source_list_type(

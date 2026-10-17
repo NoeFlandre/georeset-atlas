@@ -201,6 +201,41 @@ def test_resume_orphans_reuses_only_identical_partition_outputs(tmp_path: Path) 
     }
 
 
+def test_resume_orphans_preserves_atomic_temps_and_verifies_manifest(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "joined"
+    first = _write(output_dir, CountingBuild())
+    first.manifest_path.unlink()
+    prefix = first.manifest_path.name.removesuffix(".manifest.json")
+    temporary = output_dir / f".{prefix}.text_units.parquet.7ksuffec.tmp"
+    temporary.write_bytes(b"unfinished output preserved")
+    preserved = _outputs(output_dir)
+    build = CountingBuild()
+
+    result = write_joined_partition(
+        source_id=SOURCE_ID,
+        repo_id=REPO_ID,
+        revision=REVISION,
+        path=PATH,
+        output_dir=output_dir,
+        build=build,
+        resume_orphans=True,
+    )
+
+    assert result.status == "written"
+    assert build.calls == 1
+    assert temporary.read_bytes() == b"unfinished output preserved"
+    assert _outputs(output_dir) == preserved | {
+        result.manifest_path.name: result.manifest_path.read_bytes()
+    }
+
+    verifier = CountingBuild()
+    assert _write(output_dir, verifier).status == "verified"
+    assert verifier.calls == 0
+    assert temporary.read_bytes() == b"unfinished output preserved"
+
+
 def test_identical_rerun_verifies_the_manifest_and_skips_new_reads(
     tmp_path: Path,
 ) -> None:
@@ -842,6 +877,23 @@ def test_staged_rows_expose_the_exact_schema_of_their_groups(tmp_path: Path) -> 
     assert staged.schema_arrow.field("localized_descriptions").type == list_type
 
 
+def test_staged_rows_support_a_typed_empty_row_group(tmp_path: Path) -> None:
+    schema = pa.schema(
+        [("polygon_id", pa.string()), ("geometry", pa.binary())],
+        metadata={b"source": b"empty-fixture"},
+    )
+    staged = stage_table_groups(
+        [pa.Table.from_batches([], schema=schema)], tmp_path / "empty.parquet"
+    )
+
+    assert len(staged) == 0
+    assert staged.schema_arrow == schema
+    assert staged.read_many([]) == []
+    assert list(staged) == []
+    with pytest.raises(IndexError):
+        staged[0]
+
+
 def test_staged_rows_read_many_groups_row_groups_once_and_preserves_request_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -871,6 +923,31 @@ def test_staged_rows_read_many_groups_row_groups_once_and_preserves_request_orde
     assert [row["polygon_id"] for row in rows] == ["e", "a", "e", "c", "d"]
     assert read_groups == [0, 1, 2]
     assert staged.read_many([]) == []
+
+
+def test_staged_rows_reuses_parquet_reader_across_access_methods(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "polygons.parquet"
+    staged = stage_table_groups([pa.table({"polygon_id": ["a", "b"]})], path)
+    original_parquet_file = pq.ParquetFile
+    opened_paths: list[Path] = []
+
+    def record_open(file_path: Path) -> pq.ParquetFile:
+        opened_paths.append(Path(file_path))
+        return original_parquet_file(file_path)
+
+    monkeypatch.setattr(pq, "ParquetFile", record_open)
+
+    assert staged.schema_arrow.field("polygon_id").type == pa.string()
+    assert len(staged) == 2
+    assert staged.read_many([1, 0]) == [
+        {"polygon_id": "b"},
+        {"polygon_id": "a"},
+    ]
+    assert staged[0] == {"polygon_id": "a"}
+    assert list(staged) == [{"polygon_id": "a"}, {"polygon_id": "b"}]
+    assert opened_paths == [path]
 
 
 @pytest.mark.parametrize(

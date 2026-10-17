@@ -85,6 +85,25 @@ class FakeRangeServer:
         return FakeResponse(body, self.status, headers)
 
 
+class TimeoutOnceResponse:
+    def __init__(self, response: FakeResponse) -> None:
+        self._response = response
+        self.status = response.status
+        self.headers = response.headers
+        self.closed = False
+        self._timed_out = False
+
+    def read(self, size: int = -1) -> bytes:
+        if not self._timed_out:
+            self._timed_out = True
+            raise TimeoutError("The read operation timed out")
+        return self._response.read(size)
+
+    def close(self) -> None:
+        self.closed = True
+        self._response.close()
+
+
 def _source(payload: bytes) -> PinnedHubParquetSource:
     return PinnedHubParquetSource(
         repo_id="NoeFlandre/atlas-fixture",
@@ -111,6 +130,77 @@ def test_reader_requests_the_exact_pinned_range() -> None:
     assert request.get_header("Range") == "bytes=0-3"
 
 
+def test_reader_retries_transient_read_timeout_with_same_range_and_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"abcdefgh"
+    source = _source(payload)
+    base_server = FakeRangeServer(payload)
+    responses: list[TimeoutOnceResponse] = []
+    progress: list[str] = []
+
+    def opener(request: Request) -> FakeResponse | TimeoutOnceResponse:
+        response = base_server(request)
+        if len(base_server.requests) == 1:
+            flaky = TimeoutOnceResponse(response)
+            responses.append(flaky)
+            return flaky
+        return response
+
+    monkeypatch.setattr("atlas_io.hub_parquet.time.sleep", lambda _seconds: None)
+    with HubParquetRangeReader(
+        source,
+        max_bytes=8,
+        opener=opener,
+        progress_callback=progress.append,
+    ) as reader:
+        assert reader.read(4) == b"abcd"
+        assert reader.tell() == 4
+        assert reader.bytes_read == 4
+        assert reader.attempted_range_bytes == 8
+        assert reader.range_retries == 1
+        with pytest.raises(ByteBudgetExceeded):
+            reader.read(1)
+
+    assert responses[0].closed
+    assert len(base_server.requests) == 2
+    assert [request.get_header("Range") for request in base_server.requests] == [
+        "bytes=0-3",
+        "bytes=0-3",
+    ]
+    assert any("range_retry" in event and "TimeoutError" in event for event in progress)
+
+
+def test_reader_bounds_transient_retries_and_charges_each_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source(b"abcdefgh")
+    requests: list[Request] = []
+    progress: list[str] = []
+
+    def opener(request: Request) -> FakeResponse:
+        requests.append(request)
+        raise TimeoutError("temporary timeout")
+
+    monkeypatch.setattr("atlas_io.hub_parquet.time.sleep", lambda _seconds: None)
+    with HubParquetRangeReader(
+        source,
+        max_bytes=12,
+        opener=opener,
+        progress_callback=progress.append,
+    ) as reader:
+        with pytest.raises(TimeoutError, match="temporary timeout"):
+            reader.read(4)
+        assert reader.tell() == 0
+        assert reader.bytes_read == 0
+        assert reader.attempted_range_bytes == 12
+        assert reader.range_retries == 2
+
+    assert len(requests) == 3
+    assert {request.get_header("Range") for request in requests} == {"bytes=0-3"}
+    assert any("range_failed" in event and "attempt=3" in event for event in progress)
+
+
 def test_reader_rejects_a_non_partial_response() -> None:
     payload = b"abcdefgh"
     source = _source(payload)
@@ -122,6 +212,8 @@ def test_reader_rejects_a_non_partial_response() -> None:
 
         assert reader.tell() == 0
         assert reader.bytes_read == 0
+
+    assert len(server.requests) == 1
 
 
 @pytest.mark.parametrize(
@@ -135,7 +227,6 @@ def test_reader_rejects_a_non_partial_response() -> None:
         ({"Content-Length": ""}, 0),
         ({"Content-Encoding": "gzip"}, 0),
         ({"Content-Length": "5"}, 1),
-        ({}, -1),
     ],
 )
 def test_reader_rejects_mismatched_range_or_response_size(
@@ -156,6 +247,55 @@ def test_reader_rejects_mismatched_range_or_response_size(
 
         assert reader.tell() == 0
         assert reader.bytes_read == 0
+
+
+def test_reader_retries_a_short_range_body_then_succeeds() -> None:
+    payload = b"abcdefgh"
+    source = _source(payload)
+    short_body_server = FakeRangeServer(payload, body_adjustment=-1)
+    complete_body_server = FakeRangeServer(payload)
+    requests: list[Request] = []
+
+    def opener(request: Request) -> FakeResponse:
+        requests.append(request)
+        server = short_body_server if len(requests) == 1 else complete_body_server
+        return server(request)
+
+    progress: list[str] = []
+    with HubParquetRangeReader(
+        source, max_bytes=8, opener=opener, progress_callback=progress.append
+    ) as reader:
+        assert reader.read(4) == b"abcd"
+        assert reader.tell() == 4
+        assert reader.bytes_read == 4
+        assert reader.attempted_range_bytes == 8
+        assert reader.range_retries == 1
+
+    assert len(requests) == 2
+    assert {request.get_header("Range") for request in requests} == {"bytes=0-3"}
+    assert any(
+        "range_retry" in event and "ShortRangeBodyError" in event for event in progress
+    )
+
+
+def test_reader_bounds_retries_for_persistently_short_range_bodies() -> None:
+    payload = b"abcdefgh"
+    source = _source(payload)
+    server = FakeRangeServer(payload, body_adjustment=-1)
+    progress: list[str] = []
+
+    with HubParquetRangeReader(
+        source, max_bytes=12, opener=server, progress_callback=progress.append
+    ) as reader:
+        with pytest.raises(RangeProtocolError, match="response body"):
+            reader.read(4)
+        assert reader.tell() == 0
+        assert reader.bytes_read == 0
+        assert reader.attempted_range_bytes == 12
+        assert reader.range_retries == 2
+
+    assert len(server.requests) == 3
+    assert any("range_failed" in event and "attempt=3" in event for event in progress)
 
 
 def test_reader_enforces_a_cumulative_per_source_byte_budget() -> None:
@@ -369,6 +509,74 @@ def test_file_iterator_reads_and_releases_one_row_group_at_a_time() -> None:
     assert second.num_rows == rows_per_group
     assert stats.range_bytes > 0
     stream.close()
+
+
+def test_file_iterator_reports_row_group_and_range_progress() -> None:
+    buffer = BytesIO()
+    pq.write_table(
+        pa.table({"polygon_id": ["a", "b", "c", "d"]}),
+        buffer,
+        row_group_size=2,
+        compression="NONE",
+    )
+    payload = buffer.getvalue()
+    source = _source(payload)
+    server = FakeRangeServer(payload)
+    stats = ParquetReadStats()
+    progress: list[str] = []
+
+    tables = list(
+        iter_parquet_file(
+            source,
+            max_bytes=len(payload) * 4,
+            opener=server,
+            stats=stats,
+            progress_callback=progress.append,
+        )
+    )
+
+    assert [table.num_rows for table in tables] == [2, 2]
+    assert stats.row_groups == 2
+    assert stats.row_groups_completed == 2
+    assert stats.attempted_range_bytes == stats.range_bytes
+    assert stats.range_retries == 0
+    assert any(
+        "row_group_start" in event and "index=1/2" in event for event in progress
+    )
+    assert any(
+        "row_group_complete" in event and "index=2/2" in event for event in progress
+    )
+    assert any("range_start" in event for event in progress)
+    assert any("range_complete" in event for event in progress)
+
+
+def test_file_iterator_preserves_schema_for_a_file_with_no_row_groups() -> None:
+    schema = pa.schema(
+        [("polygon_id", pa.string()), ("geometry", pa.binary())],
+        metadata={b"source": b"empty-fixture"},
+    )
+    buffer = BytesIO()
+    with pq.ParquetWriter(buffer, schema, compression="NONE"):
+        pass
+    payload = buffer.getvalue()
+    source = _source(payload)
+    server = FakeRangeServer(payload)
+    stats = ParquetReadStats()
+
+    tables = list(
+        iter_parquet_file(
+            source,
+            max_bytes=len(payload) * 4,
+            opener=server,
+            stats=stats,
+        )
+    )
+
+    assert stats.row_groups == 0
+    assert stats.range_bytes > 0
+    assert len(tables) == 1
+    assert tables[0].num_rows == 0
+    assert tables[0].schema == schema
 
 
 def test_projection_rejects_a_missing_source_column() -> None:

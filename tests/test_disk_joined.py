@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import atlas_domain.joined_outputs as joined_outputs
@@ -20,6 +21,87 @@ from atlas_io.joined_partitions import (
 
 def _staged(rows: list[dict[str, Any]], path: Path) -> StagedRows:
     return stage_table_groups([pa.Table.from_pylist(rows)], path)
+
+
+def test_description_join_publishes_empty_typed_inputs(tmp_path: Path) -> None:
+    labels = stage_table_groups(
+        [
+            pa.Table.from_batches(
+                [],
+                schema=pa.schema(
+                    [
+                        ("description_identity", pa.string()),
+                        ("tag_key", pa.string()),
+                        ("sentence_index", pa.int64()),
+                        ("decision", pa.string()),
+                    ]
+                ),
+            )
+        ],
+        tmp_path / "labels.parquet",
+    )
+    text_units = stage_table_groups(
+        [
+            pa.Table.from_batches(
+                [],
+                schema=pa.schema(
+                    [
+                        ("description_identity", pa.string()),
+                        ("tag_key", pa.string()),
+                        ("source_pbf", pa.string()),
+                        ("osm_type", pa.string()),
+                        ("osm_id", pa.string()),
+                        ("split_status", pa.string()),
+                        ("original_text", pa.string()),
+                        ("sentences", pa.list_(pa.string())),
+                        ("source_url", pa.string()),
+                        ("raw_language_code", pa.string()),
+                    ]
+                ),
+            )
+        ],
+        tmp_path / "text_units.parquet",
+    )
+    polygons = stage_table_groups(
+        [
+            pa.Table.from_batches(
+                [],
+                schema=pa.schema(
+                    [
+                        ("source_pbf", pa.string()),
+                        ("osm_type", pa.string()),
+                        ("osm_id", pa.string()),
+                        ("geometry", pa.binary()),
+                    ]
+                ),
+            )
+        ],
+        tmp_path / "polygons.parquet",
+    )
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    source = next(item for item in SOURCE_CATALOG if item.source_id == "description")
+
+    result = write_joined_partition(
+        source_id=source.source_id,
+        repo_id=source.repo_id,
+        revision=source.revision,
+        path=f"{source.table_roots['labels'][0]}/empty.parquet",
+        output_dir=output_dir,
+        build=lambda: disk_joined.build_description_partition(
+            labels=labels,
+            text_units=text_units,
+            polygons=polygons,
+            workspace_path=tmp_path / "description.sqlite",
+        ),
+    )
+
+    assert result.manifest["label_row_count"] == 0
+    assert set(result.manifest["row_counts"].values()) == {0}
+    assert all(
+        pq.ParquetFile(output_dir / output["name"]).metadata.num_rows == 0
+        for output in result.manifest["outputs"].values()
+    )
 
 
 def test_description_indexed_join_keeps_cross_batch_duplicates_and_source_order(
@@ -799,7 +881,12 @@ def test_atlas_join_routes_wiki_through_disk_builder(
         }
         staged_rows = staged[table_names[table]]
         return staged_rows, SimpleNamespace(
-            rows=len(staged_rows), row_groups=1, range_bytes=1
+            rows=len(staged_rows),
+            row_groups=1,
+            row_groups_completed=1,
+            range_bytes=1,
+            attempted_range_bytes=1,
+            range_retries=0,
         )
 
     def write_partition(**kwargs: Any) -> SimpleNamespace:

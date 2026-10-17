@@ -13,6 +13,7 @@ The Atlas uses three source datasets. Each source is pinned to one revision.
 - [Methods](methods.md): source pins, pipeline stages, label counts, the language crosswalk, the map plan, and GPU hours.
 - [Data schema](data-schema.md): logical tables, target tables, join keys, and limitations.
 - [Release status](release-status.md): open gates and rights.
+- [Licensing and attribution](licensing-and-attribution.md): source-specific terms, attribution, and the owner publication decision.
 
 ## Current state
 

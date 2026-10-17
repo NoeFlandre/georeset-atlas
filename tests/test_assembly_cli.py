@@ -1,4 +1,6 @@
 import json
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -81,7 +83,12 @@ def test_global_cli_checkpoints_each_partition_and_reconciles_expected_totals(
     )
     calls: list[str] = []
 
-    def runner(argv: list[str], *, opener: Any = None) -> int:
+    def runner(
+        argv: list[str],
+        *,
+        opener: Any = None,
+        progress_callback: Any = None,
+    ) -> int:
         calls.append(argv[argv.index("--labels") + 1])
         output_dir = Path(argv[argv.index("--output-dir") + 1])
         path = joined_manifest_path(output_dir, "fixture", "labels/data/a.parquet")
@@ -107,6 +114,95 @@ def test_global_cli_checkpoints_each_partition_and_reconciles_expected_totals(
         "skipped": 1,
     }
     assert (output_dir / "assembly-manifest.json").is_file()
+    heartbeat = json.loads((output_dir / "assembly-heartbeat.json").read_text())
+    assert heartbeat["status"] == "partition_completed"
+    assert heartbeat["phase"] == "checkpoint"
+    assert heartbeat["current_partition"] == {
+        "source_id": "fixture",
+        "labels_path": "labels/data/a.parquet",
+    }
+    assert heartbeat["plan_sha256"] == progress["plan_sha256"]
+
+
+def test_global_cli_refreshes_partition_heartbeat_during_join(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source()
+    monkeypatch.setattr(assembly_cli, "SOURCE_CATALOG", (source,))
+    monkeypatch.setattr(
+        assembly_cli, "fetch_pinned_files", lambda *_args, **_kwargs: _files()
+    )
+    monkeypatch.setattr(assembly_cli, "_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+
+    def runner(
+        argv: list[str],
+        *,
+        opener: Any = None,
+        progress_callback: Any = None,
+    ) -> int:
+        output_dir = Path(argv[argv.index("--output-dir") + 1])
+        heartbeat_path = output_dir / "assembly-heartbeat.json"
+        before = json.loads(heartbeat_path.read_text())["updated_at_utc"]
+        assert progress_callback is not None
+        progress_callback("table=labels row_group_start index=1/1")
+        time.sleep(0.04)
+        heartbeat = json.loads(heartbeat_path.read_text())
+        after = heartbeat["updated_at_utc"]
+        assert after != before
+        assert heartbeat["stage"] == "table=labels row_group_start index=1/1"
+        _write_manifest(
+            output_dir,
+            status_counts={"yes": 1, "no": 1, "failed": 1, "skipped": 1},
+        )
+        return 0
+
+    monkeypatch.setattr(assembly_cli, "run_joined_partition", runner)
+    output_dir = tmp_path / "assembly"
+
+    assert assembly_cli.main(["--output-dir", str(output_dir)]) == 0
+    heartbeat = json.loads((output_dir / "assembly-heartbeat.json").read_text())
+    assert heartbeat["stage"] == "table=labels row_group_start index=1/1"
+
+
+def test_global_cli_persists_join_error_detail_in_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = _source()
+    monkeypatch.setattr(assembly_cli, "SOURCE_CATALOG", (source,))
+    monkeypatch.setattr(
+        assembly_cli, "fetch_pinned_files", lambda *_args, **_kwargs: _files()
+    )
+
+    def failing_runner(
+        _argv: list[str],
+        *,
+        opener: Any = None,
+        progress_callback: Any = None,
+    ) -> int:
+        print("atlas-join: error: orphan temp output", file=sys.stderr)
+        return assembly_cli.EXIT_CONFLICT
+
+    monkeypatch.setattr(assembly_cli, "run_joined_partition", failing_runner)
+    output_dir = tmp_path / "assembly"
+
+    assert (
+        assembly_cli.main(["--output-dir", str(output_dir)])
+        == assembly_cli.EXIT_PARTITION
+    )
+
+    progress = json.loads((output_dir / "assembly-progress.json").read_text())
+    assert progress["status"] == "interrupted_partition"
+    assert progress["error"] == (
+        "atlas-join exit code 3: atlas-join: error: orphan temp output"
+    )
+    assert "atlas-join: error: orphan temp output" in capsys.readouterr().err
+    heartbeat = json.loads((output_dir / "assembly-heartbeat.json").read_text())
+    assert heartbeat["status"] == "failed"
+    assert heartbeat["phase"] == "join"
+    assert heartbeat["error"] == progress["error"]
 
 
 def test_global_cli_resumes_by_verifying_existing_partition_manifests(
@@ -120,7 +216,12 @@ def test_global_cli_resumes_by_verifying_existing_partition_manifests(
     )
     calls = 0
 
-    def runner(argv: list[str], *, opener: Any = None) -> int:
+    def runner(
+        argv: list[str],
+        *,
+        opener: Any = None,
+        progress_callback: Any = None,
+    ) -> int:
         nonlocal calls
         calls += 1
         output_dir = Path(argv[argv.index("--output-dir") + 1])
@@ -155,7 +256,12 @@ def test_global_cli_refuses_to_start_when_storage_budget_is_not_met(
         lambda _path: SimpleNamespace(free=1),
     )
 
-    def reject_runner(_argv: list[str], *, opener: Any = None) -> int:
+    def reject_runner(
+        _argv: list[str],
+        *,
+        opener: Any = None,
+        progress_callback: Any = None,
+    ) -> int:
         raise AssertionError("partition reads must not start below the storage budget")
 
     monkeypatch.setattr(assembly_cli, "run_joined_partition", reject_runner)
@@ -220,7 +326,12 @@ def test_global_cli_does_not_write_complete_manifest_when_totals_mismatch(
         assembly_cli, "fetch_pinned_files", lambda *_args, **_kwargs: _files()
     )
 
-    def runner(argv: list[str], *, opener: Any = None) -> int:
+    def runner(
+        argv: list[str],
+        *,
+        opener: Any = None,
+        progress_callback: Any = None,
+    ) -> int:
         _write_manifest(
             Path(argv[argv.index("--output-dir") + 1]),
             status_counts={"yes": 1, "no": 1, "failed": 1, "skipped": 0},

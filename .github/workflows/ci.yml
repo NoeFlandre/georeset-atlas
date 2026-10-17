@@ -32,11 +32,11 @@ jobs:
       - name: Check locked dependency set
         run: uv lock --check
       - name: Lint
-        run: uv run --locked --no-sync ruff check --no-cache .
+        run: uv run --locked --no-sync ruff check --no-cache src tests tools
       - name: Check formatting
-        run: uv run --locked --no-sync ruff format --check .
+        run: uv run --locked --no-sync ruff format --check src tests tools
       - name: Check types
-        run: uv run --locked --no-sync ty check
+        run: uv run --locked --no-sync ty check src tests tools
       - name: Run tests
         run: uv run --locked --no-sync pytest -q
       - name: Smoke-test CLI help

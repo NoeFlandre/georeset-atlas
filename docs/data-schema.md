@@ -38,6 +38,10 @@ The configs below are intended. Implementation is pending.
 - The `all_labeled` view exposes `yes` and `no` labels, plus `failed` and `skipped` labels.
 - Source-specific configs, the polygon companion, and the generation audit views share native Parquet shards partitioned by source and status. They do not copy the full data.
 
+## License and attribution metadata
+
+The output combines components with different source terms. Do not assign one license to the complete Atlas. The Wiki document `license` and `attribution` fields and Website `source_url` fields remain tied to their source components. The Website source card says its text is not covered by ODbL; see [Licensing and attribution](licensing-and-attribution.md) and the repository-root `component-rights.json`. The Wiki document fields still require a full-export readback check.
+
 ## Planned storage and preservation
 
 - Outputs are Parquet files (a columnar file format), partitioned by source and status.

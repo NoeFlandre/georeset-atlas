@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "global_license": null,
+  "status": "website_text_rights_unresolved_public_release_blocked",
+  "release_decision": {
+    "scope": "Keep all three sources in the local full assembly; block public release of Website text until its source-site redistribution basis is documented and approved.",
+    "website_rights_verified": false,
+    "public_release_blocked": true
+  },
+  "components": [
+    {
+      "id": "osm_geometry",
+      "license": "ODbL-1.0",
+      "attribution": "\u00a9 OpenStreetMap contributors",
+      "scope": {
+        "sources": [
+          "description",
+          "website",
+          "wiki"
+        ],
+        "logical_input_tables": [
+          "polygons",
+          "polygons_and_text.geometry"
+        ],
+        "target_table": "polygon_records",
+        "target_fields": [
+          "geometry and source OSM tags"
+        ]
+      },
+      "evidence": "Pinned source-card declarations; see NOTICE.md and docs/methods.md.",
+      "license_text": "https://opendatacommons.org/licenses/odbl/1-0/"
+    },
+    {
+      "id": "labeled_source_tables",
+      "license": "ODbL-1.0",
+      "scope": {
+        "sources": [
+          "description",
+          "website",
+          "wiki"
+        ],
+        "logical_input_table": "labels",
+        "target_table": "labels"
+      },
+      "evidence": "Pinned labeled-input card declarations. This scope does not relabel other source content.",
+      "license_text": "https://opendatacommons.org/licenses/odbl/1-0/"
+    },
+    {
+      "id": "wikidata_structured_facts",
+      "license": "CC0-1.0",
+      "scope": {
+        "source": "wiki",
+        "logical_source_component": "Wikidata structured facts",
+        "output_mapping": "Not a source of the Wikipedia/Wikivoyage sentence labels; reconcile exact exported fields before assigning a target field."
+      },
+      "license_text": "https://creativecommons.org/publicdomain/zero/1.0/legalcode.en"
+    },
+    {
+      "id": "wikipedia_wikivoyage_text",
+      "license": "CC-BY-SA-per-source-document",
+      "scope": {
+        "source": "wiki",
+        "logical_input_tables": [
+          "text_units",
+          "documents"
+        ],
+        "target_tables": [
+          "text_units",
+          "documents"
+        ],
+        "target_fields": [
+          "text_units.text",
+          "text_units.source_url",
+          "documents.license",
+          "documents.attribution"
+        ]
+      },
+      "obligations": "Retain exact document-level license and attribution values; verify exported fields before claiming preservation.",
+      "license_texts": [
+        "https://creativecommons.org/licenses/by-sa/4.0/legalcode.en",
+        "https://creativecommons.org/licenses/by-sa/3.0/legalcode"
+      ]
+    },
+    {
+      "id": "website_text",
+      "license": "unverified-original-site-terms",
+      "atlas_license_grant": false,
+      "permission_evidence_recorded": false,
+      "scope": {
+        "source": "website",
+        "logical_input_table": "polygons_and_text",
+        "target_table": "text_units",
+        "target_fields": [
+          "text_units.text",
+          "text_units.full_text",
+          "text_units.source_url"
+        ]
+      },
+      "publication_note": "Public release remains blocked until the source-site redistribution basis is documented and approved. This record grants no rights."
+    }
+  ]
+}

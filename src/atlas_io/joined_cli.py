@@ -3,7 +3,7 @@ import http.client
 import shutil
 import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -59,7 +59,10 @@ class InsufficientDiskSpace(OSError):
 class _InputTotals:
     rows: int
     row_groups: int
+    row_groups_completed: int
     range_bytes: int
+    attempted_range_bytes: int
+    range_retries: int
 
 
 _SUPPORTED_SOURCE_IDS = frozenset({"description", "website", "wiki"})
@@ -92,6 +95,7 @@ def _stage_rows(
     max_bytes: int,
     opener: HubOpener | None,
     directory: Path,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[StagedRows, _InputTotals]:
     pinned = PinnedHubParquetSource(
         repo_id=source.repo_id,
@@ -100,6 +104,12 @@ def _stage_rows(
         size_bytes=size_bytes,
     )
     stats = ParquetReadStats()
+
+    def report(event: str) -> None:
+        if progress_callback is not None:
+            progress_callback(f"table={table} {event}")
+
+    report(f"stage=opening path={path}")
     try:
         staged = stage_table_groups(
             iter_parquet_file(
@@ -107,13 +117,41 @@ def _stage_rows(
                 max_bytes=max_bytes,
                 opener=opener,
                 stats=stats,
+                progress_callback=report,
             ),
             directory / f"{table}.parquet",
         )
     except _INPUT_ERRORS as error:
+        report(
+            f"stage=failed row_groups={stats.row_groups_completed}/"
+            f"{stats.row_groups} range_bytes={stats.range_bytes} "
+            f"attempted_range_bytes={stats.attempted_range_bytes} "
+            f"range_retries={stats.range_retries} "
+            f"error={type(error).__name__}"
+        )
         error.add_note(f"while reading {table} input {path}")
+        error.add_note(
+            f"after {stats.row_groups_completed}/{stats.row_groups} row groups; "
+            f"range_bytes={stats.range_bytes}; "
+            f"attempted_range_bytes={stats.attempted_range_bytes}; "
+            f"range_retries={stats.range_retries}"
+        )
         raise
-    return staged, _InputTotals(len(staged), stats.row_groups, stats.range_bytes)
+    report(
+        f"stage=complete rows={len(staged)} row_groups="
+        f"{stats.row_groups_completed}/{stats.row_groups} "
+        f"range_bytes={stats.range_bytes} "
+        f"attempted_range_bytes={stats.attempted_range_bytes} "
+        f"range_retries={stats.range_retries}"
+    )
+    return staged, _InputTotals(
+        len(staged),
+        stats.row_groups,
+        stats.row_groups_completed,
+        stats.range_bytes,
+        stats.attempted_range_bytes,
+        stats.range_retries,
+    )
 
 
 def _output_schemas(
@@ -197,7 +235,12 @@ def _report_error(code: int, error: BaseException) -> int:
     return code
 
 
-def main(argv: Sequence[str] | None = None, *, opener: HubOpener | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    opener: HubOpener | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
@@ -215,6 +258,8 @@ def main(argv: Sequence[str] | None = None, *, opener: HubOpener | None = None) 
 
     def build() -> JoinedPartition:
         args.output_dir.mkdir(parents=True, exist_ok=True)
+        if progress_callback is not None:
+            progress_callback("stage=resolve_input_sizes")
         sizes = {
             table: resolve_hub_file_size(
                 source.repo_id, source.revision, path, opener=opener
@@ -235,11 +280,15 @@ def main(argv: Sequence[str] | None = None, *, opener: HubOpener | None = None) 
                 max_bytes=args.max_bytes,
                 opener=opener,
                 directory=directory,
+                progress_callback=progress_callback,
             )
             staged_tables[table] = staged
             print(
-                f"input {table}: rows={stats.rows} row_groups={stats.row_groups} "
-                f"range_bytes={stats.range_bytes}"
+                f"input {table}: rows={stats.rows} "
+                f"row_groups={stats.row_groups_completed}/{stats.row_groups} "
+                f"range_bytes={stats.range_bytes} "
+                f"attempted_range_bytes={stats.attempted_range_bytes} "
+                f"range_retries={stats.range_retries}"
             )
         try:
             if source.source_id == "description":
@@ -273,6 +322,7 @@ def main(argv: Sequence[str] | None = None, *, opener: HubOpener | None = None) 
     def source_schemas() -> dict[str, pa.Schema]:
         return _output_schemas(source, staged_tables)
 
+    partition_written = False
     try:
         try:
             result = write_joined_partition(
@@ -285,6 +335,7 @@ def main(argv: Sequence[str] | None = None, *, opener: HubOpener | None = None) 
                 schema_provider=source_schemas,
                 resume_orphans=args.resume_orphans,
             )
+            partition_written = True
         except JoinedPartitionConflictError as error:
             return _report_error(EXIT_CONFLICT, error)
         except ByteBudgetExceeded as error:
@@ -295,7 +346,13 @@ def main(argv: Sequence[str] | None = None, *, opener: HubOpener | None = None) 
             return _report_error(EXIT_INPUT_ERROR, error)
     finally:
         for directory in staging_dirs:
-            shutil.rmtree(directory, ignore_errors=True)
+            if partition_written:
+                shutil.rmtree(directory, ignore_errors=True)
+            elif directory.is_dir():
+                print(
+                    f"atlas-join: preserved incomplete staging directory {directory}",
+                    file=sys.stderr,
+                )
     label_rows = result.manifest["label_row_count"]
     print(result.status, result.manifest_path, f"label_rows={label_rows}")
     return EXIT_OK

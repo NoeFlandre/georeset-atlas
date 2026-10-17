@@ -1,5 +1,7 @@
 import json
+from http.client import HTTPMessage
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import unquote, urlsplit
 
 import pytest
@@ -88,6 +90,61 @@ def test_pinned_tree_inventory_and_plan_resolve_all_partition_companions() -> No
     assert plan.largest_partition.source_id == "fixture"
     assert plan.largest_partition.labels_path == "labels/data/b.parquet"
     assert plan.largest_partition.input_bytes == 340
+
+
+@pytest.mark.parametrize("failure_kind", ["timeout", "http_error"])
+def test_inventory_retries_transient_metadata_failures(
+    failure_kind: str,
+) -> None:
+    source = _source()
+    hub = _hub()
+    attempts: list[str] = []
+    progress: list[str] = []
+
+    def flaky_opener(request: Any, timeout: float) -> Response:
+        attempts.append(request.full_url)
+        if len(attempts) == 1:
+            if failure_kind == "timeout":
+                raise TimeoutError("temporary read timeout")
+            raise HTTPError(
+                request.full_url, 503, "temporary unavailable", HTTPMessage(), None
+            )
+        return hub(request, timeout)
+
+    files = fetch_pinned_files(
+        (source,), opener=flaky_opener, progress_callback=progress.append
+    )
+
+    assert len(files) == 6
+    assert len(attempts) == 4
+    assert len(hub.requests) == 3
+    assert any(
+        "inventory_retry" in message and "attempt=1/3" in message
+        for message in progress
+    )
+    assert any("inventory_root_complete" in message for message in progress)
+
+
+def test_inventory_bounds_retries_after_persistent_metadata_timeout() -> None:
+    source = _source()
+    attempts: list[str] = []
+    progress: list[str] = []
+
+    def unavailable(request: Any, timeout: float) -> Response:
+        attempts.append(request.full_url)
+        raise TimeoutError("metadata timeout")
+
+    with pytest.raises(ValueError, match="after 3 attempts: TimeoutError"):
+        fetch_pinned_files(
+            (source,), opener=unavailable, progress_callback=progress.append
+        )
+
+    assert len(attempts) == 3
+    assert sum("inventory_retry" in message for message in progress) == 2
+    assert any(
+        "inventory_failed" in message and "attempt=3/3" in message
+        for message in progress
+    )
 
 
 def test_storage_budget_reserves_output_contingency_and_largest_scratch() -> None:

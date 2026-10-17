@@ -6,4 +6,4 @@ GeoReSeT Atlas is a versioned, reproducible assembly of the existing labeled Ope
 
 Source mirrors are read-only inputs pinned by immutable revisions. The release will preserve source provenance, original text occurrences and label limitations, and will not add model inference or semantic habitat classes.
 
-Draft documentation: [docs/index.md](docs/index.md).
+Draft documentation: [docs/index.md](docs/index.md). Component terms and attribution are documented in [LICENSE.md](LICENSE.md), [NOTICE.md](NOTICE.md), and [docs/licensing-and-attribution.md](docs/licensing-and-attribution.md). The Atlas is a mixed-source dataset and does not claim one blanket license.

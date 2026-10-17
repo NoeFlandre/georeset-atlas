@@ -6,8 +6,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Sequence
+import threading
+from collections.abc import Callable, Sequence
+from contextlib import redirect_stderr
 from dataclasses import asdict
+from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +44,8 @@ EXIT_RECONCILIATION = 6
 _PLAN_FILE = "assembly-plan.json"
 _PROGRESS_FILE = "assembly-progress.json"
 _MANIFEST_FILE = "assembly-manifest.json"
+_HEARTBEAT_FILE = "assembly-heartbeat.json"
+_HEARTBEAT_INTERVAL_SECONDS = 30
 
 
 class AssemblyConflictError(ValueError):
@@ -157,6 +163,68 @@ def _write_json_atomic(path: Path, payload: bytes) -> None:
             os.close(directory_fd)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _start_partition_heartbeat(
+    output_dir: Path,
+    *,
+    plan_sha256: str,
+    partitions_completed: int,
+    partitions_total: int,
+    source: SourceDataset,
+    partition: AssemblyPartition,
+) -> tuple[
+    threading.Event,
+    threading.Thread,
+    Callable[[str, str, str | None], None],
+    Callable[[str], None],
+]:
+    stopped = threading.Event()
+    path = output_dir / _HEARTBEAT_FILE
+    stage_lock = threading.Lock()
+    current_stage = "verify_or_build_manifest"
+
+    def update_stage(value: str) -> None:
+        nonlocal current_stage
+        with stage_lock:
+            current_stage = value
+
+    def write(status: str, phase: str, error: str | None = None) -> None:
+        with stage_lock:
+            stage = current_stage
+        payload: dict[str, Any] = {
+            "status": status,
+            "phase": phase,
+            "stage": stage,
+            "plan_sha256": plan_sha256,
+            "partitions_completed": partitions_completed,
+            "partitions_total": partitions_total,
+            "current_partition": {
+                "source_id": source.source_id,
+                "labels_path": partition.labels_path,
+            },
+            "pid": os.getpid(),
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            ),
+        }
+        if error is not None:
+            payload["error"] = error
+        _write_json_atomic(path, _canonical_json(payload))
+
+    def heartbeat() -> None:
+        while not stopped.wait(_HEARTBEAT_INTERVAL_SECONDS):
+            try:
+                write("running", "join")
+            except OSError:
+                return
+
+    write("running", "join")
+    thread = threading.Thread(
+        target=heartbeat, name="atlas-partition-heartbeat", daemon=True
+    )
+    thread.start()
+    return stopped, thread, write, update_stage
 
 
 def _prepare_plan(output_dir: Path, plan: dict[str, Any]) -> None:
@@ -311,6 +379,7 @@ def _run_partition(
     max_bytes: int,
     output_dir: Path,
     opener: Any,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> int:
     argv = [
         "--source",
@@ -323,7 +392,9 @@ def _run_partition(
         str(output_dir),
         "--resume-orphans",
     ]
-    return run_joined_partition(argv, opener=opener)
+    return run_joined_partition(
+        argv, opener=opener, progress_callback=progress_callback
+    )
 
 
 def main(
@@ -334,9 +405,15 @@ def main(
 ) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+
+    def report_inventory_progress(message: str) -> None:
+        print(f"ASSEMBLY_{message}", flush=True)
+
     try:
         files: tuple[HubParquetFile, ...] = fetch_pinned_files(
-            SOURCE_CATALOG, opener=metadata_opener
+            SOURCE_CATALOG,
+            opener=metadata_opener,
+            progress_callback=report_inventory_progress,
         )
         plan = build_assembly_plan(SOURCE_CATALOG, files)
         budget = estimate_storage_budget(plan)
@@ -443,14 +520,45 @@ def main(
                 file=sys.stderr,
             )
             return EXIT_BUDGET
-        partition_exit = _run_partition(
-            source,
-            partition,
-            max_bytes=args.max_bytes,
-            output_dir=args.output_dir,
-            opener=join_opener,
+        (
+            heartbeat_stop,
+            heartbeat_thread,
+            heartbeat_write,
+            update_stage,
+        ) = _start_partition_heartbeat(
+            args.output_dir,
+            plan_sha256=plan_doc["plan_sha256"],
+            partitions_completed=completed,
+            partitions_total=plan.partition_count,
+            source=source,
+            partition=partition,
         )
+        partition_stderr = StringIO()
+        try:
+            with redirect_stderr(partition_stderr):
+                partition_exit = _run_partition(
+                    source,
+                    partition,
+                    max_bytes=args.max_bytes,
+                    output_dir=args.output_dir,
+                    opener=join_opener,
+                    progress_callback=update_stage,
+                )
+        except BaseException as error:
+            heartbeat_stop.set()
+            heartbeat_thread.join()
+            heartbeat_write("failed", "join", str(error))
+            raise
+        heartbeat_stop.set()
+        heartbeat_thread.join()
         if partition_exit != 0:
+            detail = " ".join(partition_stderr.getvalue().split())
+            if len(detail) > 2048:
+                detail = detail[:2045] + "..."
+            error_message = f"atlas-join exit code {partition_exit}"
+            if detail:
+                error_message = f"{error_message}: {detail}"
+            heartbeat_write("failed", "join", error_message)
             payload = _progress_payload(
                 plan_sha256=plan_doc["plan_sha256"],
                 status="interrupted_partition",
@@ -458,17 +566,21 @@ def main(
                 partitions_total=plan.partition_count,
                 sources=source_progress,
                 output_bytes=output_bytes,
-                error=f"atlas-join exit code {partition_exit}",
+                error=error_message,
             )
             _write_json_atomic(
                 args.output_dir / _PROGRESS_FILE, _canonical_json(payload)
             )
+            print(f"atlas-assemble: {error_message}", file=sys.stderr)
             return EXIT_PARTITION
+        heartbeat_write("published", "manifest", None)
         try:
             manifest = _manifest_for_partition(args.output_dir, source, partition)
         except AssemblyConflictError as error:
+            heartbeat_write("failed", "manifest", str(error))
             print(f"atlas-assemble: manifest conflict: {error}", file=sys.stderr)
             return EXIT_CONFLICT
+        heartbeat_write("partition_completed", "checkpoint", None)
 
         counts = manifest["status_counts"]
         stats = source_progress[source.source_id]

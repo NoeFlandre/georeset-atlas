@@ -1,11 +1,13 @@
 import operator
 import re
+import time
 from collections.abc import Buffer, Callable, Generator, Iterable
 from dataclasses import dataclass
-from http.client import HTTPMessage
+from http.client import HTTPMessage, IncompleteRead, RemoteDisconnected
 from io import SEEK_CUR, SEEK_END, SEEK_SET, RawIOBase
+from ssl import SSLError
 from typing import Protocol
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
@@ -21,6 +23,10 @@ class ByteBudgetExceeded(OSError):
 
 class RangeProtocolError(OSError):
     """Raised when a server response does not match the requested byte range."""
+
+
+class ShortRangeBodyError(RangeProtocolError):
+    """Raised when a range response body ends before the requested bytes arrive."""
 
 
 class FileSizeProtocolError(OSError):
@@ -45,12 +51,18 @@ class _Response(Protocol):
 
 HubOpener = Callable[[Request], _Response]
 DEFAULT_HUB_TIMEOUT_SECONDS = 30.0
+RANGE_MAX_ATTEMPTS = 3
+_RANGE_RETRY_DELAYS_SECONDS = (0.25, 1.0)
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
 @dataclass(slots=True)
 class ParquetReadStats:
     row_groups: int = 0
+    row_groups_completed: int = 0
     range_bytes: int = 0
+    attempted_range_bytes: int = 0
+    range_retries: int = 0
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -136,6 +148,7 @@ class HubParquetRangeReader(RawIOBase):
         *,
         max_bytes: int,
         opener: HubOpener | None = None,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__()
         if (
@@ -147,13 +160,24 @@ class HubParquetRangeReader(RawIOBase):
         self.source = source
         self.max_bytes = max_bytes
         self._opener = opener
+        self._progress_callback = progress_callback
         self._position = 0
         self._budget_used = 0
         self._bytes_read = 0
+        self._attempted_range_bytes = 0
+        self._range_retries = 0
 
     @property
     def bytes_read(self) -> int:
         return self._bytes_read
+
+    @property
+    def attempted_range_bytes(self) -> int:
+        return self._attempted_range_bytes
+
+    @property
+    def range_retries(self) -> int:
+        return self._range_retries
 
     def readable(self) -> bool:
         return not self.closed
@@ -199,28 +223,96 @@ class HubParquetRangeReader(RawIOBase):
 
         start = self._position
         end = start + requested - 1
-        self._budget_used += requested
-        request = Request(
-            _source_url(self.source),
-            headers={
-                "Accept-Encoding": "identity",
-                "Range": f"bytes={start}-{end}",
-            },
-        )
         open_request = self._opener or _open_range
-        response = open_request(request)
-        try:
-            self._validate_response(response, start, end, requested)
-            body = response.read(requested)
-            if len(body) != requested:
-                raise RangeProtocolError(
-                    f"response body has {len(body)} bytes; expected {requested}"
-                )
-        finally:
-            response.close()
+        body: bytes | None = None
 
+        for attempt in range(1, RANGE_MAX_ATTEMPTS + 1):
+            remaining = self.max_bytes - self._budget_used
+            if requested > remaining:
+                raise ByteBudgetExceeded(
+                    f"range needs {requested} bytes with {remaining} bytes remaining"
+                )
+            # Charge each attempt conservatively: a failed response may have
+            # transferred bytes before its stream timed out.
+            self._budget_used += requested
+            self._attempted_range_bytes += requested
+            request = Request(
+                _source_url(self.source),
+                headers={
+                    "Accept-Encoding": "identity",
+                    "Range": f"bytes={start}-{end}",
+                },
+            )
+            self._report_progress(
+                f"range_start path={self.source.path} bytes={start}-{end} "
+                f"attempt={attempt}/{RANGE_MAX_ATTEMPTS}"
+            )
+            response: _Response | None = None
+            try:
+                response = open_request(request)
+                self._validate_response(response, start, end, requested)
+                body = response.read(requested)
+                if len(body) != requested:
+                    raise ShortRangeBodyError(
+                        f"response body has {len(body)} bytes; expected {requested}"
+                    )
+            except HTTPError as error:
+                error.close()
+                if (
+                    error.code not in _RETRYABLE_HTTP_STATUS_CODES
+                    or attempt == RANGE_MAX_ATTEMPTS
+                ):
+                    self._report_progress(
+                        f"range_failed path={self.source.path} attempt={attempt} "
+                        f"http={error.code}"
+                    )
+                    raise
+                self._range_retries += 1
+                self._report_progress(
+                    f"range_retry path={self.source.path} attempt={attempt} "
+                    f"http={error.code}"
+                )
+                time.sleep(_RANGE_RETRY_DELAYS_SECONDS[attempt - 1])
+            except (
+                ShortRangeBodyError,
+                ConnectionError,
+                IncompleteRead,
+                RemoteDisconnected,
+                SSLError,
+                TimeoutError,
+                URLError,
+            ) as error:
+                body = None
+                if response is not None:
+                    response.close()
+                    response = None
+                if attempt == RANGE_MAX_ATTEMPTS:
+                    self._report_progress(
+                        f"range_failed path={self.source.path} attempt={attempt} "
+                        f"error={type(error).__name__}"
+                    )
+                    raise
+                self._range_retries += 1
+                self._report_progress(
+                    f"range_retry path={self.source.path} attempt={attempt} "
+                    f"error={type(error).__name__}"
+                )
+                time.sleep(_RANGE_RETRY_DELAYS_SECONDS[attempt - 1])
+            finally:
+                if response is not None:
+                    response.close()
+            if body is not None:
+                break
+
+        if body is None:
+            raise RuntimeError("range request ended without data or an error")
         self._position += requested
         self._bytes_read += requested
+        self._report_progress(
+            f"range_complete path={self.source.path} bytes={start}-{end} "
+            f"attempted_bytes={self._attempted_range_bytes} "
+            f"retries={self._range_retries}"
+        )
         return body
 
     def readinto(self, buffer: Buffer) -> int:
@@ -266,6 +358,10 @@ class HubParquetRangeReader(RawIOBase):
             raise RangeProtocolError(
                 f"Content-Length is {content_length}; expected {requested}"
             )
+
+    def _report_progress(self, message: str) -> None:
+        if self._progress_callback is not None:
+            self._progress_callback(message)
 
     def _check_open(self) -> None:
         if self.closed:
@@ -333,11 +429,20 @@ def iter_parquet_file(
     max_bytes: int,
     opener: HubOpener | None = None,
     stats: ParquetReadStats | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> Generator[pa.Table, None, None]:
     read_stats = stats if stats is not None else ParquetReadStats()
     read_stats.row_groups = 0
+    read_stats.row_groups_completed = 0
     read_stats.range_bytes = 0
-    with HubParquetRangeReader(source, max_bytes=max_bytes, opener=opener) as reader:
+    read_stats.attempted_range_bytes = 0
+    read_stats.range_retries = 0
+    with HubParquetRangeReader(
+        source,
+        max_bytes=max_bytes,
+        opener=opener,
+        progress_callback=progress_callback,
+    ) as reader:
         try:
             parquet_file = pq.ParquetFile(reader)
             names = parquet_file.schema_arrow.names
@@ -345,9 +450,31 @@ def iter_parquet_file(
             if ambiguous:
                 raise ValueError(f"ambiguous column(s): {', '.join(ambiguous)}")
             read_stats.row_groups = parquet_file.metadata.num_row_groups
-            for index in range(read_stats.row_groups):
-                table = parquet_file.read_row_group(index, columns=names)
+            if read_stats.row_groups == 0:
                 read_stats.range_bytes = reader.bytes_read
+                yield pa.Table.from_batches([], schema=parquet_file.schema_arrow)
+                return
+            for index in range(read_stats.row_groups):
+                if progress_callback is not None:
+                    progress_callback(
+                        f"row_group_start path={source.path} "
+                        f"index={index + 1}/{read_stats.row_groups}"
+                    )
+                table = parquet_file.read_row_group(index, columns=names)
+                read_stats.row_groups_completed += 1
+                read_stats.range_bytes = reader.bytes_read
+                read_stats.attempted_range_bytes = reader.attempted_range_bytes
+                read_stats.range_retries = reader.range_retries
+                if progress_callback is not None:
+                    progress_callback(
+                        f"row_group_complete path={source.path} "
+                        f"index={index + 1}/{read_stats.row_groups} "
+                        f"rows={table.num_rows} range_bytes={reader.bytes_read} "
+                        f"attempted_range_bytes={reader.attempted_range_bytes} "
+                        f"retries={reader.range_retries}"
+                    )
                 yield table
         finally:
             read_stats.range_bytes = reader.bytes_read
+            read_stats.attempted_range_bytes = reader.attempted_range_bytes
+            read_stats.range_retries = reader.range_retries

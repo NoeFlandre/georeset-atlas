@@ -1,4 +1,3 @@
-import heapq
 import sqlite3
 from collections import Counter
 from collections.abc import Iterator, Mapping
@@ -28,7 +27,7 @@ from atlas_domain.occurrences import (
     wiki_sentence_key,
 )
 from atlas_domain.source_records import DataJoinError, description_text_for_label
-from atlas_io.disk_join_index import DiskJoinIndex, DiskMembershipSet
+from atlas_io.disk_join_index import DiskJoinIndex, DiskMembershipSet, JoinKey
 from atlas_io.joined_partitions import StagedRows, _schema_with_source
 
 _BATCH_ROWS = 512
@@ -89,13 +88,13 @@ class _AssociatedPolygonRows:
         self._associations = associations
 
     def __iter__(self) -> Iterator[Row]:
-        streams = (
-            self._index.iter_row_indices((_POLYGON_ASSOCIATION, association))
-            for association in self._associations
+        occurrences = self._index.iter_row_occurrences_for_keys(
+            (_POLYGON_ASSOCIATION, association) for association in self._associations
         )
-        ordinals = heapq.merge(*streams)
-        while batch := list(islice(ordinals, _BATCH_ROWS)):
-            yield from self._polygons.read_many(batch)
+        while batch := list(islice(occurrences, _BATCH_ROWS)):
+            yield from self._polygons.read_many(
+                [row_ordinal for _, row_ordinal in batch]
+            )
 
 
 def _polygon_rows_for_associations(
@@ -283,18 +282,19 @@ class _DescriptionTextUnits:
                 label_rows = self._labels.read_many(
                     [int(record[4]) for record in records]
                 )
-                polygon_ids_by_association: dict[DescriptionAssociation, list[str]] = {}
+                associations = {
+                    description_association(text_unit, "text_unit")
+                    for text_unit in text_rows
+                }
+                polygon_ids_by_association = _polygon_ids_for_associations(
+                    index, self._polygons, associations
+                )
                 for record, text_unit, label in zip(
                     records, text_rows, label_rows, strict=True
                 ):
                     key = (str(record[0]), str(record[1]), int(record[2]))
                     association = description_association(text_unit, "text_unit")
-                    polygon_ids = polygon_ids_by_association.get(association)
-                    if polygon_ids is None:
-                        polygon_ids = _polygon_ids_for_association(
-                            index, self._polygons, association
-                        )
-                        polygon_ids_by_association[association] = polygon_ids
+                    polygon_ids = polygon_ids_by_association[association]
                     yield {
                         **text_unit,
                         "text_unit_key": key,
@@ -307,19 +307,28 @@ class _DescriptionTextUnits:
             connection.close()
 
 
-def _polygon_ids_for_association(
+def _polygon_ids_for_associations(
     index: DiskJoinIndex,
     polygons: StagedRows,
-    association: DescriptionAssociation,
-) -> list[str]:
-    ordinals = index.iter_row_indices((_POLYGON_ASSOCIATION, association))
-    polygon_ids: list[str] = []
-    while batch := list(islice(ordinals, _BATCH_ROWS)):
-        polygon_ids.extend(
-            description_polygon_identity(polygon, "polygon")[1]
-            for polygon in polygons.read_many(batch)
-        )
-    return polygon_ids
+    associations: set[DescriptionAssociation],
+) -> dict[DescriptionAssociation, list[str]]:
+    association_keys: dict[DescriptionAssociation, JoinKey] = {
+        association: (_POLYGON_ASSOCIATION, association) for association in associations
+    }
+    polygon_ids_by_key: dict[JoinKey, list[str]] = {
+        key: [] for key in association_keys.values()
+    }
+    occurrences = index.iter_row_occurrences_for_keys(association_keys.values())
+    while batch := list(islice(occurrences, _BATCH_ROWS)):
+        polygon_rows = polygons.read_many([row_ordinal for _, row_ordinal in batch])
+        for (key, _), polygon in zip(batch, polygon_rows, strict=True):
+            polygon_ids_by_key[key].append(
+                description_polygon_identity(polygon, "polygon")[1]
+            )
+    return {
+        association: polygon_ids_by_key[key]
+        for association, key in association_keys.items()
+    }
 
 
 class _DescriptionPolygons:
