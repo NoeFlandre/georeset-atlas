@@ -118,18 +118,42 @@ def _canonical_json(value: Any) -> bytes:
 
 
 def _implementation_revision() -> str:
-    repository = Path(__file__).resolve().parents[2]
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repository,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    revision = result.stdout.strip()
-    if len(revision) != 40 or any(char not in "0123456789abcdef" for char in revision):
-        raise AssemblyConflictError("git returned an invalid implementation revision")
-    return revision
+    module_path = Path(__file__).resolve()
+    repository = module_path.parents[2]
+    if not (repository / "src").is_dir():
+        repository = module_path.parents[1]
+    try:
+        root_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=repository,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        root_result = None
+    if (
+        root_result is not None
+        and root_result.returncode == 0
+        and Path(root_result.stdout.strip()).resolve() == repository
+    ):
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repository,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            result = None
+        if result is not None and result.returncode == 0:
+            revision = result.stdout.strip()
+            if len(revision) == 40 and all(
+                char in "0123456789abcdef" for char in revision
+            ):
+                return revision
+    return f"source-tree-sha256:{_source_tree_sha256(repository)}"
 
 
 def _plan_body_document(document: dict[str, Any]) -> dict[str, Any]:
@@ -511,6 +535,40 @@ def _manifest_for_partition(
     return manifest
 
 
+def _existing_output_inventory(
+    output_dir: Path,
+    sources: Sequence[SourceDataset],
+    plan: AssemblyPlan,
+) -> tuple[set[str], int, dict[str, int]]:
+    source_by_id = {source.source_id: source for source in sources}
+    seen_outputs: set[str] = set()
+    output_bytes = 0
+    output_rows = {
+        "labels": 0,
+        "text_units": 0,
+        "polygon_records": 0,
+        "documents": 0,
+        "polygon_document_links": 0,
+    }
+    for partition in plan.partitions:
+        source = source_by_id[partition.source_id]
+        manifest_path = joined_manifest_path(
+            output_dir, source.source_id, partition.labels_path
+        )
+        if not manifest_path.exists():
+            continue
+        manifest = _manifest_for_partition(output_dir, source, partition)
+        for table, output in manifest["outputs"].items():
+            name = output["name"]
+            if name in seen_outputs:
+                continue
+            seen_outputs.add(name)
+            output_bytes += output["size_bytes"]
+            if table in output_rows:
+                output_rows[table] += output["row_count"]
+    return seen_outputs, output_bytes, output_rows
+
+
 def _expected_totals(sources: Sequence[SourceDataset]) -> dict[str, dict[str, int]]:
     return {
         source.source_id: {
@@ -635,17 +693,17 @@ def main(
         print(f"atlas-assemble: execution identity error: {error}", file=sys.stderr)
         return EXIT_INPUT
 
-    try:
-        free, required = _check_budget(
-            args.output_dir,
-            budget=budget,
-            output_bytes=0,
-        )
-    except (OSError, StorageBudgetError) as error:
-        print(f"atlas-assemble: storage preflight failed: {error}", file=sys.stderr)
-        return EXIT_BUDGET
-
+    existing_outputs: tuple[set[str], int, dict[str, int]] | None = None
     if args.dry_run:
+        try:
+            free, required = _check_budget(
+                args.output_dir,
+                budget=budget,
+                output_bytes=0,
+            )
+        except (OSError, StorageBudgetError) as error:
+            print(f"atlas-assemble: storage preflight failed: {error}", file=sys.stderr)
+            return EXIT_BUDGET
         summary = {
             "plan_sha256": plan_doc["plan_sha256"],
             "execution_identity": plan_doc["execution_identity"],
@@ -663,16 +721,51 @@ def main(
         print(json.dumps(summary, sort_keys=True))
         return EXIT_OK
 
-    try:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        plan_doc = _prepare_plan(
-            args.output_dir,
-            plan_doc,
-            allow_legacy_checkpoint=args.allow_legacy_checkpoint,
-        )
-    except (OSError, AssemblyConflictError) as error:
-        print(f"atlas-assemble: output conflict: {error}", file=sys.stderr)
-        return EXIT_CONFLICT
+    existing_plan_path = args.output_dir / _PLAN_FILE
+    if existing_plan_path.is_file():
+        try:
+            plan_doc = _prepare_plan(
+                args.output_dir,
+                plan_doc,
+                allow_legacy_checkpoint=args.allow_legacy_checkpoint,
+            )
+            existing_outputs = _existing_output_inventory(
+                args.output_dir,
+                SOURCE_CATALOG,
+                plan,
+            )
+        except (OSError, AssemblyConflictError) as error:
+            print(f"atlas-assemble: output conflict: {error}", file=sys.stderr)
+            return EXIT_CONFLICT
+        try:
+            free, required = _check_budget(
+                args.output_dir,
+                budget=budget,
+                output_bytes=existing_outputs[1],
+            )
+        except (OSError, StorageBudgetError) as error:
+            print(f"atlas-assemble: storage preflight failed: {error}", file=sys.stderr)
+            return EXIT_BUDGET
+    else:
+        try:
+            free, required = _check_budget(
+                args.output_dir,
+                budget=budget,
+                output_bytes=0,
+            )
+        except (OSError, StorageBudgetError) as error:
+            print(f"atlas-assemble: storage preflight failed: {error}", file=sys.stderr)
+            return EXIT_BUDGET
+        try:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            plan_doc = _prepare_plan(
+                args.output_dir,
+                plan_doc,
+                allow_legacy_checkpoint=args.allow_legacy_checkpoint,
+            )
+        except (OSError, AssemblyConflictError) as error:
+            print(f"atlas-assemble: output conflict: {error}", file=sys.stderr)
+            return EXIT_CONFLICT
 
     if "legacy_checkpoint" in plan_doc:
         print(
@@ -691,15 +784,18 @@ def main(
         }
         for source in SOURCE_CATALOG
     }
-    seen_outputs: set[str] = set()
-    output_bytes = 0
-    output_rows = {
-        "labels": 0,
-        "text_units": 0,
-        "polygon_records": 0,
-        "documents": 0,
-        "polygon_document_links": 0,
-    }
+    if existing_outputs is None:
+        seen_outputs: set[str] = set()
+        output_bytes = 0
+        output_rows = {
+            "labels": 0,
+            "text_units": 0,
+            "polygon_records": 0,
+            "documents": 0,
+            "polygon_document_links": 0,
+        }
+    else:
+        seen_outputs, output_bytes, output_rows = existing_outputs
     completed = 0
     new_partitions_completed = 0
     print(
